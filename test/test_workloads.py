@@ -66,8 +66,9 @@ def test_git_workflow(tmpdir, capfd):
     mount_process, mnt_dir, src_dir = _mount_sshfs(tmpdir, _no_cache_opts())
     try:
         repo_dir = pjoin(mnt_dir, "repo")
+        # Use file:// URL to avoid git's safe-directory checks for local paths
         subprocess.check_call(
-            ["git", "clone", "--depth=1", "--local", FIXTURE_HELLO_C, repo_dir]
+            ["git", "clone", "--depth=1", f"file://{FIXTURE_HELLO_C}", repo_dir]
         )
         subprocess.check_call(
             ["git", "-C", repo_dir, "status", "--porcelain"],

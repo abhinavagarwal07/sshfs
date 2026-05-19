@@ -807,9 +807,15 @@ def test_direct_io(tmpdir, capfd):
 
 def test_writeback_cache(tmpdir, capfd):
     capfd.register_output(r"^Warning: Permanently added 'localhost' .+", count=0)
-    mount_process, mnt_dir, src_dir = _mount_sshfs(
-        tmpdir, ["writeback_cache", "dir_cache=no"]
-    )
+    capfd.register_output(r"fuse: unknown option", count=0)
+    try:
+        mount_process, mnt_dir, src_dir = _mount_sshfs(
+            tmpdir, ["writeback_cache", "dir_cache=no"]
+        )
+    except BaseException as e:
+        if "terminated prematurely" in str(e):
+            pytest.skip("writeback_cache not supported as a mount option on this FUSE version")
+        raise
     try:
         # Sub-test 1: truncate-after-write (regression test for issues #81, #88)
         path = pjoin(mnt_dir, name_generator())
