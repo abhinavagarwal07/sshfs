@@ -980,9 +980,25 @@ def test_sshd_kill_reconnect(tmpdir, capfd):
 
     import time
 
-    sshd_path = shutil.which("sshd") or "/usr/sbin/sshd"
-    if not os.path.isfile(sshd_path):
+    if not shutil.which("sshd") and not os.path.isfile("/usr/sbin/sshd"):
         pytest.skip("sshd not available")
+    sshd_path = shutil.which("sshd") or "/usr/sbin/sshd"
+
+    # Find sftp-server for the sshd Subsystem line
+    sftp_server_path = None
+    for candidate in [
+        "/usr/lib/openssh/sftp-server",
+        "/usr/libexec/sftp-server",
+        "/usr/lib/ssh/sftp-server",
+        "/usr/libexec/openssh/sftp-server",
+    ]:
+        if os.path.isfile(candidate):
+            sftp_server_path = candidate
+            break
+    if sftp_server_path is None:
+        sftp_server_path = shutil.which("sftp-server")
+    if sftp_server_path is None:
+        pytest.skip("sftp-server not found; cannot configure test sshd")
 
     key_dir = str(tmpdir.mkdir("keys"))
     host_key = pjoin(key_dir, "host_key")
@@ -1002,6 +1018,7 @@ def test_sshd_kill_reconnect(tmpdir, capfd):
         f.write(pub)
     os.chmod(auth_keys, 0o600)
 
+    # Write sshd_config — Subsystem line is required for sftp/sshfs to work
     with open(sshd_config_path, "w") as f:
         f.write(
             f"Port 2223\n"
@@ -1012,19 +1029,55 @@ def test_sshd_kill_reconnect(tmpdir, capfd):
             f"UsePAM no\n"
             f"PasswordAuthentication no\n"
             f"PubkeyAuthentication yes\n"
-            f"LogLevel ERROR\n"
+            f"LogLevel DEBUG\n"
             f"PidFile {pjoin(key_dir, 'sshd.pid')}\n"
+            f"Subsystem sftp {sftp_server_path}\n"
         )
 
     def _start_sshd():
+        # Try without sudo first (works on GHA where the runner can bind
+        # ports >1024), then fall back to sudo.
         for cmd in [
-            ["sudo", sshd_path, "-f", sshd_config_path, "-D"],
             [sshd_path, "-f", sshd_config_path, "-D"],
+            ["sudo", sshd_path, "-f", sshd_config_path, "-D"],
         ]:
-            proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            time.sleep(0.5)
-            if proc.poll() is None:
+            proc = subprocess.Popen(
+                cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+            # Wait up to 3s for the daemon to become ready by probing the port.
+            deadline = time.time() + 3.0
+            ready = False
+            while time.time() < deadline:
+                if proc.poll() is not None:
+                    break  # process already exited — wrong cmd, try next
+                try:
+                    r = subprocess.run(
+                        [
+                            "ssh", "-p", "2223",
+                            "-i", client_key,
+                            "-o", "StrictHostKeyChecking=no",
+                            "-o", "UserKnownHostsFile=/dev/null",
+                            "-o", "BatchMode=yes",
+                            "-o", "ConnectTimeout=1",
+                            "localhost", "true",
+                        ],
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                        timeout=2,
+                    )
+                    if r.returncode == 0:
+                        ready = True
+                        break
+                except subprocess.TimeoutExpired:
+                    pass
+                time.sleep(0.2)
+            if ready:
                 return proc
+            # Daemon didn't become ready; kill it and try next command variant.
+            proc.terminate()
+            try:
+                proc.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                proc.kill()
         return None
 
     sshd_proc = _start_sshd()
@@ -1044,14 +1097,17 @@ def test_sshd_kill_reconnect(tmpdir, capfd):
             "-o", "dir_cache=no",
             "-o", "reconnect",
             "-o", "StrictHostKeyChecking=no",
+            "-o", "UserKnownHostsFile=/dev/null",
             "-o", f"IdentityFile={client_key}",
             "-o", "PasswordAuthentication=no",
+            "-o", "BatchMode=yes",
+            "-o", "ConnectTimeout=5",
             "-o", "ServerAliveInterval=2",
             "-o", "ServerAliveCountMax=2",
         ]
         new_env = dict(os.environ)
         new_env["G_DEBUG"] = "fatal-warnings"
-        mount_process = subprocess.Popen(cmdline, env=new_env, stderr=subprocess.DEVNULL)
+        mount_process = subprocess.Popen(cmdline, env=new_env)
 
         try:
             wait_for_mount(mount_process, mnt_dir)
