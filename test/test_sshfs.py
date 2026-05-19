@@ -781,12 +781,34 @@ def test_follow_symlinks(tmpdir, capfd):
         umount(mount_process, mnt_dir)
 
 
+def _find_fixture(rel_path):
+    """Find a test fixture, searching both the script's directory and the
+    source tree root (needed when pytest runs from the meson build directory
+    where test scripts are copied but fixtures are not)."""
+    # Try next to this script first (running tests directly from source tree)
+    candidate = os.path.join(os.path.dirname(os.path.abspath(__file__)), rel_path)
+    if os.path.exists(candidate):
+        return candidate
+    # Fall back to MESON_SOURCE_ROOT if set
+    meson_src = os.environ.get('MESON_SOURCE_ROOT')
+    if meson_src:
+        candidate = os.path.join(meson_src, 'test', rel_path)
+        if os.path.exists(candidate):
+            return candidate
+    # When running from build/test/, walk up two levels to reach source root
+    source_root = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '..'))
+    candidate = os.path.join(source_root, 'test', rel_path)
+    if os.path.exists(candidate):
+        return candidate
+    raise FileNotFoundError(f'Test fixture not found: {rel_path}')
+
+
 def test_git_workflow(tmpdir, capfd):
     capfd.register_output(r"^Warning: Permanently added 'localhost' .+", count=0)
     mount_process, mnt_dir, src_dir = _mount_sshfs(tmpdir)
     try:
         # Create a temporary git repo from the hello_c fixture
-        fixture_dir = os.path.join(os.path.dirname(__file__), 'fixtures', 'hello_c')
+        fixture_dir = _find_fixture(os.path.join('fixtures', 'hello_c'))
         temp_repo = str(tmpdir.mkdir('temp_repo'))
         shutil.copytree(fixture_dir, os.path.join(temp_repo, 'hello_c'))
 
