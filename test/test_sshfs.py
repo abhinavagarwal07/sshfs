@@ -781,6 +781,50 @@ def test_follow_symlinks(tmpdir, capfd):
         umount(mount_process, mnt_dir)
 
 
+def test_git_workflow(tmpdir, capfd):
+    capfd.register_output(r"^Warning: Permanently added 'localhost' .+", count=0)
+    mount_process, mnt_dir, src_dir = _mount_sshfs(tmpdir)
+    try:
+        # Create a temporary git repo from the hello_c fixture
+        fixture_dir = os.path.join(os.path.dirname(__file__), 'fixtures', 'hello_c')
+        temp_repo = str(tmpdir.mkdir('temp_repo'))
+        shutil.copytree(fixture_dir, os.path.join(temp_repo, 'hello_c'))
+
+        # Init git repo in temp location (NOT in the fixture dir)
+        subprocess.check_call(['git', 'init', temp_repo], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        subprocess.check_call(['git', '-C', temp_repo, 'config', 'user.email', 'test@example.com'])
+        subprocess.check_call(['git', '-C', temp_repo, 'config', 'user.name', 'Test'])
+        subprocess.check_call(['git', '-C', temp_repo, 'add', '.'], stdout=subprocess.DEVNULL)
+        subprocess.check_call(['git', '-C', temp_repo, 'commit', '-m', 'initial'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+        # Clone into the sshfs mount using file:// URL
+        repo_on_mount = os.path.join(mnt_dir, 'repo')
+        subprocess.check_call(['git', 'clone', f'file://{temp_repo}', repo_on_mount])
+
+        # Configure identity in the cloned repo
+        subprocess.check_call(['git', '-C', repo_on_mount, 'config', 'user.email', 'test@example.com'])
+        subprocess.check_call(['git', '-C', repo_on_mount, 'config', 'user.name', 'Test'])
+
+        # Verify clean status
+        status = subprocess.check_output(['git', '-C', repo_on_mount, 'status', '--porcelain'], text=True)
+        assert status.strip() == '', f'unexpected dirty status: {status}'
+
+        # Create a new file, add, commit
+        with open(os.path.join(repo_on_mount, 'newfile.txt'), 'w') as f:
+            f.write('hello from test\n')
+        subprocess.check_call(['git', '-C', repo_on_mount, 'add', 'newfile.txt'])
+        subprocess.check_call(['git', '-C', repo_on_mount, 'commit', '-m', 'add newfile'])
+
+        # Verify commit appears in log
+        log = subprocess.check_output(['git', '-C', repo_on_mount, 'log', '--oneline'], text=True)
+        assert 'add newfile' in log
+    except:
+        cleanup(mount_process, mnt_dir)
+        raise
+    else:
+        umount(mount_process, mnt_dir)
+
+
 def test_direct_io(tmpdir, capfd):
     capfd.register_output(r"^Warning: Permanently added 'localhost' .+", count=0)
     mount_process, mnt_dir, src_dir = _mount_sshfs(tmpdir, ["direct_io"])
