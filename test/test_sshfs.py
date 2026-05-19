@@ -803,3 +803,45 @@ def test_direct_io(tmpdir, capfd):
         raise
     else:
         umount(mount_process, mnt_dir)
+
+
+def test_fsx(tmpdir, capfd):
+    capfd.register_output(r"^Warning: Permanently added 'localhost' .+", count=0)
+
+    # Find fsx-linux binary
+    fsx_candidates = [
+        "/usr/lib/ltp/testcases/bin/fsx-linux",
+        "/usr/lib/ltp/testcases/bin/fsx",
+    ]
+    fsx_bin = None
+    for candidate in fsx_candidates:
+        if os.path.isfile(candidate):
+            fsx_bin = candidate
+            break
+    if fsx_bin is None:
+        fsx_bin = shutil.which("fsx-linux") or shutil.which("fsx")
+    if fsx_bin is None:
+        pytest.skip("fsx-linux not found (install ltp package)")
+
+    mount_process, mnt_dir, src_dir = _mount_sshfs(tmpdir)
+    try:
+        fsx_file = pjoin(mnt_dir, "fsx-testfile")
+        result = subprocess.run(
+            [fsx_bin, "-N", "10000", "-l", str(1024 * 1024), "-S", "42", fsx_file],
+            capture_output=True,
+            text=True,
+            timeout=300,
+        )
+        if result.returncode != 0:
+            pytest.fail(
+                f"fsx-linux failed (exit {result.returncode}):\n"
+                f"stdout (last 2000): {result.stdout[-2000:]}\n"
+                f"stderr (last 500): {result.stderr[-500:]}"
+            )
+    except subprocess.TimeoutExpired:
+        pytest.fail("fsx-linux timed out after 300 seconds")
+    except:
+        cleanup(mount_process, mnt_dir)
+        raise
+    else:
+        umount(mount_process, mnt_dir)
