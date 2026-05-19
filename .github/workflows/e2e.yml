@@ -35,7 +35,7 @@ jobs:
       - name: run option tests
         run: |
           cd build
-          python3 -m pytest test/test_sshfs.py \
+          python3 -m pytest test/ \
             -k "test_writeback_cache or test_sshfs_sync or test_no_readahead \
                 or test_small_max_rw or test_truncate_workaround \
                 or test_fstat_workaround or test_createmode_workaround \
@@ -75,12 +75,12 @@ jobs:
 
       - name: init fixture git repo
         run: |
-          cd test/fixtures/hello_c
-          git config user.email "ci@example.com"
-          git config user.name "CI"
-          git init || true
-          git add . || true
-          git commit -m "initial commit" --allow-empty || true
+          git -C test/fixtures/hello_c init
+          git -C test/fixtures/hello_c config user.email "ci@example.com"
+          git -C test/fixtures/hello_c config user.name "CI"
+          git -C test/fixtures/hello_c add .
+          git -C test/fixtures/hello_c commit -m "initial commit" 2>/dev/null || true
+          cp -r test/fixtures build/test/
 
       - name: run workload tests
         run: |
@@ -118,14 +118,8 @@ jobs:
           cat ~/.ssh/id_rsa.pub >> ~/.ssh/authorized_keys
           chmod 600 ~/.ssh/authorized_keys
 
-      - name: init fixture git repo
-        run: |
-          cd test/fixtures/hello_c
-          git config user.email "ci@example.com"
-          git config user.name "CI"
-          git init || true
-          git add . || true
-          git commit -m "initial commit" --allow-empty || true
+      - name: copy fixtures to build dir
+        run: cp -r test/fixtures build/test/
 
       - name: run compile test
         run: |
@@ -183,7 +177,9 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y \
             libfuse3-dev libglib2.0-dev meson ninja-build \
-            openssh-server fuse3 ltp
+            openssh-server fuse3
+          # ltp is optional; fsx test skips if binary not found
+          sudo apt-get install -y ltp || echo "ltp not available, fsx test will skip"
           pip3 install pytest
 
       - name: build sshfs
@@ -191,9 +187,8 @@ jobs:
 
       - name: build fsstress from xfstests
         run: |
-          git clone --depth=1 https://github.com/kdave/xfstests /tmp/xfstests
-          cd /tmp/xfstests
-          make ltp 2>&1 | tail -20 || echo "fsstress build failed, will skip test"
+          git clone --depth=1 https://github.com/kdave/xfstests /tmp/xfstests || exit 0
+          cd /tmp/xfstests && make ltp 2>&1 | tail -20 || echo "fsstress build failed, test will skip"
 
       - name: setup ssh
         run: |
@@ -204,5 +199,4 @@ jobs:
       - name: run stress tests
         run: |
           cd build
-          python3 -m pytest test/test_stress.py \
-            --timeout=600
+          python3 -m pytest test/test_stress.py --timeout=600

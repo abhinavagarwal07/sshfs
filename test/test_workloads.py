@@ -40,8 +40,29 @@ def _no_cache_opts():
 # test_git_workflow
 # ---------------------------------------------------------------------------
 
+def _ensure_fixture_git_repo():
+    """Initialize the hello_c fixture as a git repo if it isn't one already."""
+    git_dir = pjoin(FIXTURE_HELLO_C, ".git")
+    if not os.path.isdir(git_dir):
+        subprocess.check_call(["git", "init", FIXTURE_HELLO_C],
+                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        subprocess.check_call(
+            ["git", "-C", FIXTURE_HELLO_C, "config", "user.email", "ci@example.com"]
+        )
+        subprocess.check_call(
+            ["git", "-C", FIXTURE_HELLO_C, "config", "user.name", "CI"]
+        )
+        subprocess.check_call(["git", "-C", FIXTURE_HELLO_C, "add", "."],
+                              stdout=subprocess.DEVNULL)
+        subprocess.check_call(
+            ["git", "-C", FIXTURE_HELLO_C, "commit", "-m", "initial commit"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+
+
 def test_git_workflow(tmpdir, capfd):
     capfd.register_output(r"^Warning: Permanently added 'localhost' .+", count=0)
+    _ensure_fixture_git_repo()
     mount_process, mnt_dir, src_dir = _mount_sshfs(tmpdir, _no_cache_opts())
     try:
         repo_dir = pjoin(mnt_dir, "repo")
