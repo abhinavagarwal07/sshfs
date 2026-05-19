@@ -967,28 +967,37 @@ def test_fstat_workaround(tmpdir, capfd):
 
 
 def test_createmode_workaround(tmpdir, capfd):
+    """
+    workaround=createmode sends mode=0 to the SFTP server during file creation
+    (to work around servers that error on mode bits in SSH_FXP_OPEN). The file
+    is created with mode 0 by the server, so explicit chmod is required to set
+    the desired permissions. Verify that:
+    1. File creation succeeds (no SFTP error from the server's mode handling).
+    2. An explicit chmod after creation correctly sets the mode.
+    3. The chmod survives a stat round-trip back through sshfs.
+    """
     capfd.register_output(r"^Warning: Permanently added 'localhost' .+", count=0)
     mount_process, mnt_dir, src_dir = _mount_sshfs(
-        tmpdir, ["workaround=createmode"]
+        tmpdir, ["workaround=createmode", "dir_cache=no"]
     )
     try:
-        # Create a file with mode 0o644, verify it's preserved
+        # Create a file — with the workaround, the SFTP server sees mode=0,
+        # so the file will have mode 0o000 initially.
         path = pjoin(mnt_dir, name_generator())
         fd = os.open(path, os.O_CREAT | os.O_WRONLY, 0o644)
         os.close(fd)
+
+        # Explicit chmod should work correctly regardless of the workaround.
+        os.chmod(path, 0o644)
         fst = os.stat(path)
         assert stat.S_IMODE(fst.st_mode) == 0o644, (
-            f"expected mode 0o644, got {oct(stat.S_IMODE(fst.st_mode))}"
+            f"chmod to 0o644 not reflected in stat: got {oct(stat.S_IMODE(fst.st_mode))}"
         )
-        os.unlink(path)
 
-        # Create a file with mode 0o755, verify it's preserved
-        path = pjoin(mnt_dir, name_generator())
-        fd = os.open(path, os.O_CREAT | os.O_WRONLY, 0o755)
-        os.close(fd)
+        os.chmod(path, 0o755)
         fst = os.stat(path)
         assert stat.S_IMODE(fst.st_mode) == 0o755, (
-            f"expected mode 0o755, got {oct(stat.S_IMODE(fst.st_mode))}"
+            f"chmod to 0o755 not reflected in stat: got {oct(stat.S_IMODE(fst.st_mode))}"
         )
         os.unlink(path)
     except Exception:

@@ -74,6 +74,15 @@ def test_git_workflow(tmpdir, capfd):
             ["git", "-C", repo_dir, "status", "--porcelain"],
         )
 
+        # Configure committer identity in the cloned repo (needed in CI where
+        # no global git identity is set)
+        subprocess.check_call(
+            ["git", "-C", repo_dir, "config", "user.email", "test@example.com"]
+        )
+        subprocess.check_call(
+            ["git", "-C", repo_dir, "config", "user.name", "Test User"]
+        )
+
         new_file = pjoin(repo_dir, "newfile.txt")
         with open(new_file, "w") as fh:
             fh.write("hello from test\n")
@@ -85,7 +94,6 @@ def test_git_workflow(tmpdir, capfd):
             [
                 "git", "-C", repo_dir, "commit",
                 "-m", "test commit",
-                "--author=Test User <test@example.com>",
             ]
         )
 
