@@ -9,6 +9,7 @@ if __name__ == "__main__":
 import subprocess
 import os
 import sys
+import time
 import pytest
 import stat
 import shutil
@@ -789,8 +790,6 @@ def test_sshd_kill_no_reconnect(tmpdir, capfd):
     capfd.register_output(r"Broken pipe", count=0)
     capfd.register_output(r"remote host has disconnected", count=0)
 
-    import time
-
     if not shutil.which("sshd") and not os.path.isfile("/usr/sbin/sshd"):
         pytest.skip("sshd not available")
     sshd_path = shutil.which("sshd") or "/usr/sbin/sshd"
@@ -924,7 +923,7 @@ def test_sshd_kill_no_reconnect(tmpdir, capfd):
 
         try:
             wait_for_mount(mount_process, mnt_dir)
-        except:
+        except Exception:
             sshd_proc.terminate()
             cleanup(mount_process, mnt_dir)
             raise
