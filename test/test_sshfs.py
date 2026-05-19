@@ -14,6 +14,8 @@ import stat
 import shutil
 import filecmp
 import errno
+import hashlib
+import random
 from tempfile import NamedTemporaryFile
 from util import (
     wait_for_mount,
@@ -799,6 +801,133 @@ def test_direct_io(tmpdir, capfd):
 
         os.unlink(mnt_name)
     except Exception:
+        cleanup(mount_process, mnt_dir)
+        raise
+    else:
+        umount(mount_process, mnt_dir)
+
+
+def test_large_file(tmpdir, capfd):
+    capfd.register_output(r"^Warning: Permanently added 'localhost' .+", count=0)
+    mount_process, mnt_dir, src_dir = _mount_sshfs(tmpdir)
+    try:
+        CHUNK_SIZE = 128 * 1024        # 128 KB
+        NUM_CHUNKS = 512               # 64 MB total
+        SEEK_SIZE = 1024 * 1024        # 1 MB aligned seeks
+        NUM_SEEKS = 20
+
+        # Build a reproducible 128 KB chunk from a seeded RNG
+        rng = random.Random(0xdeadbeef)
+        chunk = bytes(rng.getrandbits(8) for _ in range(CHUNK_SIZE))
+
+        filename = pjoin(mnt_dir, name_generator())
+
+        # Write 512 chunks (64 MB) in a loop
+        hasher_write = hashlib.sha256()
+        with open(filename, "wb") as fh:
+            for _ in range(NUM_CHUNKS):
+                fh.write(chunk)
+                hasher_write.update(chunk)
+        expected_hash = hasher_write.digest()
+
+        # Sequential read-back, verify SHA-256
+        hasher_read = hashlib.sha256()
+        with open(filename, "rb") as fh:
+            while True:
+                buf = fh.read(CHUNK_SIZE)
+                if not buf:
+                    break
+                hasher_read.update(buf)
+        assert hasher_read.digest() == expected_hash, "SHA-256 mismatch on sequential read"
+
+        # Random seek verification: 20 random 1 MB-aligned offsets
+        total_size = CHUNK_SIZE * NUM_CHUNKS
+        seek_rng = random.Random(42)
+        max_offset = (total_size // SEEK_SIZE) - 1
+        with open(filename, "rb") as fh:
+            for _ in range(NUM_SEEKS):
+                block_idx = seek_rng.randint(0, max_offset)
+                offset = block_idx * SEEK_SIZE
+                fh.seek(offset)
+                buf = fh.read(SEEK_SIZE)
+                assert len(buf) == SEEK_SIZE, f"Short read at offset {offset}"
+                # Reconstruct expected bytes for this 1 MB window
+                expected = bytearray()
+                lo = offset % CHUNK_SIZE
+                remaining = SEEK_SIZE
+                while remaining > 0:
+                    take = min(CHUNK_SIZE - lo, remaining)
+                    expected += chunk[lo:lo + take]
+                    remaining -= take
+                    lo = 0
+                assert buf == bytes(expected), f"Content mismatch at offset {offset}"
+
+        os.unlink(filename)
+    except:
+        cleanup(mount_process, mnt_dir)
+        raise
+    else:
+        umount(mount_process, mnt_dir)
+
+
+def test_random_file_ops(tmpdir, capfd):
+    capfd.register_output(r"^Warning: Permanently added 'localhost' .+", count=0)
+    mount_process, mnt_dir, src_dir = _mount_sshfs(tmpdir)
+    try:
+        INITIAL_SIZE = 512 * 1024      # 512 KB
+        MAX_SIZE = INITIAL_SIZE + 1    # upper bound for truncate
+        MAX_RW_LEN = 8 * 1024          # 8 KB max per op
+        ITERATIONS = 500
+
+        rng = random.Random(0xdeadbeef)
+        ops = ["write", "truncate", "read_verify"]
+
+        filename = pjoin(mnt_dir, name_generator())
+
+        # Create file with initial zeros
+        with open(filename, "wb") as fh:
+            fh.write(b"\x00" * INITIAL_SIZE)
+
+        ground_truth = bytearray(INITIAL_SIZE)
+
+        for _ in range(ITERATIONS):
+            op = rng.choice(ops)
+            current_len = len(ground_truth)
+
+            if op == "write":
+                if current_len == 0:
+                    continue
+                offset = rng.randint(0, current_len - 1)
+                length = rng.randint(1, min(MAX_RW_LEN, current_len - offset))
+                data = bytes(rng.getrandbits(8) for _ in range(length))
+                with open(filename, "r+b") as fh:
+                    fh.seek(offset)
+                    fh.write(data)
+                ground_truth[offset:offset + length] = data
+
+            elif op == "truncate":
+                new_size = rng.randint(0, MAX_SIZE)
+                os.truncate(filename, new_size)
+                if new_size > current_len:
+                    ground_truth.extend(b"\x00" * (new_size - current_len))
+                else:
+                    del ground_truth[new_size:]
+
+            elif op == "read_verify":
+                if current_len == 0:
+                    continue
+                offset = rng.randint(0, current_len - 1)
+                length = rng.randint(1, min(MAX_RW_LEN, current_len - offset))
+                with open(filename, "rb") as fh:
+                    fh.seek(offset)
+                    buf = fh.read(length)
+                expected = bytes(ground_truth[offset:offset + length])
+                assert buf == expected, (
+                    f"read_verify mismatch at offset={offset} length={length}"
+                )
+
+        os.unlink(filename)
+    except:
         cleanup(mount_process, mnt_dir)
         raise
     else:
