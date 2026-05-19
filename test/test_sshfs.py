@@ -9,6 +9,7 @@ if __name__ == "__main__":
 import subprocess
 import os
 import sys
+import time
 import pytest
 import stat
 import shutil
@@ -808,8 +809,6 @@ def test_direct_io(tmpdir, capfd):
 def test_latency_basic_ops(tmpdir, capfd):
     capfd.register_output(r"^Warning: Permanently added 'localhost' .+", count=0)
 
-    import time
-
     _check_ssh_localhost()
 
     # Create a delay proxy script
@@ -873,7 +872,7 @@ except (BrokenPipeError, ConnectionResetError, OSError):
 
     try:
         wait_for_mount(mount_process, mnt_dir)
-    except:
+    except Exception:
         cleanup(mount_process, mnt_dir)
         raise
 
@@ -909,7 +908,7 @@ except (BrokenPipeError, ConnectionResetError, OSError):
         os.unlink(renamed)
         assert not os.path.exists(renamed)
 
-    except:
+    except Exception:
         cleanup(mount_process, mnt_dir)
         raise
     else:
