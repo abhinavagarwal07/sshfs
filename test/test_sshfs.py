@@ -803,3 +803,62 @@ def test_direct_io(tmpdir, capfd):
         raise
     else:
         umount(mount_process, mnt_dir)
+
+
+def test_sshfs_sync(tmpdir, capfd):
+    capfd.register_output(r"^Warning: Permanently added 'localhost' .+", count=0)
+    mount_process, mnt_dir, src_dir = _mount_sshfs(tmpdir, ['sshfs_sync'])
+    try:
+        tst_open_write(src_dir, mnt_dir)
+        tst_append(src_dir, mnt_dir)
+        tst_truncate_path(mnt_dir)
+        tst_fsync(src_dir, mnt_dir)
+    except:
+        cleanup(mount_process, mnt_dir)
+        raise
+    else:
+        umount(mount_process, mnt_dir)
+
+
+def test_no_readahead(tmpdir, capfd):
+    capfd.register_output(r"^Warning: Permanently added 'localhost' .+", count=0)
+    mount_process, mnt_dir, src_dir = _mount_sshfs(tmpdir, ['no_readahead'])
+    try:
+        tst_open_read(src_dir, mnt_dir)
+        tst_seek(src_dir, mnt_dir)
+        tst_truncate_path(mnt_dir)
+    except:
+        cleanup(mount_process, mnt_dir)
+        raise
+    else:
+        umount(mount_process, mnt_dir)
+
+
+def test_small_max_rw(tmpdir, capfd):
+    capfd.register_output(r"^Warning: Permanently added 'localhost' .+", count=0)
+    mount_process, mnt_dir, src_dir = _mount_sshfs(
+        tmpdir, ['max_read=4096', 'max_write=4096']
+    )
+    try:
+        tst_open_read(src_dir, mnt_dir)
+        tst_open_write(src_dir, mnt_dir)
+        tst_truncate_path(mnt_dir)
+    except:
+        cleanup(mount_process, mnt_dir)
+        raise
+    else:
+        umount(mount_process, mnt_dir)
+
+
+def test_delay_connect(tmpdir, capfd):
+    capfd.register_output(r"^Warning: Permanently added 'localhost' .+", count=0)
+    mount_process, mnt_dir, src_dir = _mount_sshfs(tmpdir, ['delay_connect'])
+    try:
+        tst_create(mnt_dir)
+        tst_open_read(src_dir, mnt_dir)
+        tst_open_write(src_dir, mnt_dir)
+    except:
+        cleanup(mount_process, mnt_dir)
+        raise
+    else:
+        umount(mount_process, mnt_dir)
