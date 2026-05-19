@@ -803,3 +803,114 @@ def test_direct_io(tmpdir, capfd):
         raise
     else:
         umount(mount_process, mnt_dir)
+
+
+def test_latency_basic_ops(tmpdir, capfd):
+    capfd.register_output(r"^Warning: Permanently added 'localhost' .+", count=0)
+
+    import time
+
+    _check_ssh_localhost()
+
+    # Create a delay proxy script
+    proxy_script = str(tmpdir.join("delay_proxy.py"))
+    with open(proxy_script, "w") as f:
+        f.write('''
+import select, socket, sys, time
+
+DELAY = 0.02  # 20ms per chunk
+
+sock = socket.create_connection(("127.0.0.1", 22))
+sock.setblocking(False)
+stdin = sys.stdin.buffer
+stdout = sys.stdout.buffer
+
+try:
+    while True:
+        readable, _, _ = select.select([sock, sys.stdin], [], [], 5.0)
+        if not readable:
+            continue
+        for r in readable:
+            if r is sock:
+                try:
+                    data = sock.recv(65536)
+                except BlockingIOError:
+                    continue
+                if not data:
+                    sys.exit(0)
+                time.sleep(DELAY)
+                stdout.write(data)
+                stdout.flush()
+            else:
+                data = stdin.read1(65536) if hasattr(stdin, 'read1') else stdin.read(65536)
+                if not data:
+                    sys.exit(0)
+                time.sleep(DELAY)
+                sock.sendall(data)
+except (BrokenPipeError, ConnectionResetError, OSError):
+    pass
+''')
+
+    # Mount with the delay proxy
+    mnt_dir = str(tmpdir.mkdir("mnt_latency"))
+    src_dir = str(tmpdir.mkdir("src_latency"))
+
+    proxy_cmd = f"python3 {proxy_script}"
+
+    cmdline = base_cmdline + [
+        pjoin(basename, "sshfs"),
+        "-f",
+        f"localhost:{src_dir}",
+        mnt_dir,
+        "-o", "entry_timeout=0",
+        "-o", "attr_timeout=0",
+        "-o", "dir_cache=no",
+        "-o", f"ProxyCommand={proxy_cmd}",
+    ]
+    new_env = dict(os.environ)
+    new_env["G_DEBUG"] = "fatal-warnings"
+    mount_process = subprocess.Popen(cmdline, env=new_env)
+
+    try:
+        wait_for_mount(mount_process, mnt_dir)
+    except:
+        cleanup(mount_process, mnt_dir)
+        raise
+
+    try:
+        # Basic ops under latency — verify correctness, not speed
+        # Create
+        test_file = pjoin(mnt_dir, "latency_test")
+        with open(test_file, "wb") as f:
+            f.write(b"hello under latency\n")
+
+        # Read back
+        with open(test_file, "rb") as f:
+            assert f.read() == b"hello under latency\n"
+
+        # Stat
+        st = os.stat(test_file)
+        assert st.st_size == 20
+
+        # Append
+        with open(test_file, "ab") as f:
+            f.write(b"appended\n")
+        with open(test_file, "rb") as f:
+            content = f.read()
+        assert content == b"hello under latency\nappended\n"
+
+        # Rename
+        renamed = pjoin(mnt_dir, "latency_renamed")
+        os.rename(test_file, renamed)
+        assert os.path.exists(renamed)
+        assert not os.path.exists(test_file)
+
+        # Unlink
+        os.unlink(renamed)
+        assert not os.path.exists(renamed)
+
+    except:
+        cleanup(mount_process, mnt_dir)
+        raise
+    else:
+        umount(mount_process, mnt_dir)
