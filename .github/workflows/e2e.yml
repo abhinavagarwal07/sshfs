@@ -21,7 +21,7 @@ jobs:
           sudo apt-get install -y \
             libfuse3-dev libglib2.0-dev meson ninja-build \
             openssh-server fuse3
-          pip3 install pytest
+          pip3 install pytest pytest-timeout
 
       - name: build
         run: mkdir build && cd build && meson .. && ninja
@@ -33,9 +33,10 @@ jobs:
           chmod 600 ~/.ssh/authorized_keys
 
       - name: run option tests
+        env:
+          SSHFS_BUILD_DIR: ${{ github.workspace }}/build
         run: |
-          cd build
-          python3 -m pytest test/ \
+          python3 -m pytest -c test/pytest.ini test/test_sshfs.py \
             -k "test_writeback_cache or test_sshfs_sync or test_no_readahead \
                 or test_small_max_rw or test_truncate_workaround \
                 or test_fstat_workaround or test_createmode_workaround \
@@ -62,7 +63,7 @@ jobs:
           sudo apt-get install -y \
             libfuse3-dev libglib2.0-dev meson ninja-build \
             openssh-server fuse3 rsync gcc make git
-          pip3 install pytest
+          pip3 install pytest pytest-timeout
 
       - name: build
         run: mkdir build && cd build && meson .. && ninja
@@ -82,9 +83,10 @@ jobs:
           git -C test/fixtures/hello_c commit -m "initial commit" 2>/dev/null || true
 
       - name: run workload tests
+        env:
+          SSHFS_BUILD_DIR: ${{ github.workspace }}/build
         run: |
-          cd build
-          python3 -m pytest test/test_workloads.py \
+          python3 -m pytest -c test/pytest.ini test/test_workloads.py \
             -k "not test_compile_c_project" \
             --timeout=600
 
@@ -106,7 +108,7 @@ jobs:
           sudo apt-get install -y \
             libfuse3-dev libglib2.0-dev meson ninja-build \
             openssh-server fuse3 gcc make
-          pip3 install pytest
+          pip3 install pytest pytest-timeout
 
       - name: build
         run: mkdir build && cd build && meson .. && ninja
@@ -118,9 +120,10 @@ jobs:
           chmod 600 ~/.ssh/authorized_keys
 
       - name: run compile test
+        env:
+          SSHFS_BUILD_DIR: ${{ github.workspace }}/build
         run: |
-          cd build
-          python3 -m pytest test/test_workloads.py::test_compile_c_project --timeout=300
+          python3 -m pytest -c test/pytest.ini test/test_workloads.py::test_compile_c_project --timeout=300
 
   # -------------------------------------------------------------------------
   # e2e-errors: error path tests in test_errors.py
@@ -140,7 +143,7 @@ jobs:
           sudo apt-get install -y \
             libfuse3-dev libglib2.0-dev meson ninja-build \
             openssh-server fuse3
-          pip3 install pytest
+          pip3 install pytest pytest-timeout
 
       - name: build
         run: mkdir build && cd build && meson .. && ninja
@@ -152,9 +155,10 @@ jobs:
           chmod 600 ~/.ssh/authorized_keys
 
       - name: run error path tests
+        env:
+          SSHFS_BUILD_DIR: ${{ github.workspace }}/build
         run: |
-          cd build
-          python3 -m pytest test/test_errors.py --timeout=300
+          python3 -m pytest -c test/pytest.ini test/test_errors.py --timeout=300
 
   # -------------------------------------------------------------------------
   # e2e-stress: stress / fsx / fsstress / concurrent / dual-mount / reconnect
@@ -176,7 +180,7 @@ jobs:
             openssh-server fuse3
           # ltp is optional; fsx test skips if binary not found
           sudo apt-get install -y ltp || echo "ltp not available, fsx test will skip"
-          pip3 install pytest
+          pip3 install pytest pytest-timeout
 
       - name: build sshfs
         run: mkdir build && cd build && meson .. && ninja
@@ -193,6 +197,7 @@ jobs:
           chmod 600 ~/.ssh/authorized_keys
 
       - name: run stress tests
+        env:
+          SSHFS_BUILD_DIR: ${{ github.workspace }}/build
         run: |
-          cd build
-          python3 -m pytest test/test_stress.py --timeout=600
+          python3 -m pytest -c test/pytest.ini test/test_stress.py --timeout=600

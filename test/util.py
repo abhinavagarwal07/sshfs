@@ -7,7 +7,10 @@ import time
 from os.path import join as pjoin
 from contextlib import contextmanager
 
-basename = pjoin(os.path.dirname(__file__), "..")
+basename = os.environ.get(
+    "SSHFS_BUILD_DIR",
+    pjoin(os.path.dirname(os.path.abspath(__file__)), ".."),
+)
 
 
 def _check_ssh_localhost():

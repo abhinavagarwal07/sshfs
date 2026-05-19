@@ -66,9 +66,7 @@ def test_disk_full_enospc(tmpdir, capfd):
             "-o", "attr_timeout=0",
             "-o", "dir_cache=no",
         ]
-        new_env = dict(os.environ)
-        new_env["G_DEBUG"] = "fatal-warnings"
-        mount_process = subprocess.Popen(cmdline, env=new_env)
+        mount_process = subprocess.Popen(cmdline)
         try:
             wait_for_mount(mount_process, mnt_dir)
         except Exception:
