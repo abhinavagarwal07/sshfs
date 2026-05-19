@@ -80,7 +80,6 @@ jobs:
           git -C test/fixtures/hello_c config user.name "CI"
           git -C test/fixtures/hello_c add .
           git -C test/fixtures/hello_c commit -m "initial commit" 2>/dev/null || true
-          cp -r test/fixtures build/test/
 
       - name: run workload tests
         run: |
@@ -117,9 +116,6 @@ jobs:
           ssh-keygen -b 2048 -t rsa -f ~/.ssh/id_rsa -q -N ""
           cat ~/.ssh/id_rsa.pub >> ~/.ssh/authorized_keys
           chmod 600 ~/.ssh/authorized_keys
-
-      - name: copy fixtures to build dir
-        run: cp -r test/fixtures build/test/
 
       - name: run compile test
         run: |
