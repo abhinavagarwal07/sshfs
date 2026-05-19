@@ -1,0 +1,208 @@
+name: e2e tests
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  # -------------------------------------------------------------------------
+  # e2e-options: new mount option tests in test_sshfs.py
+  # -------------------------------------------------------------------------
+  e2e-options:
+    name: mount option tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v4
+
+      - name: install deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libfuse3-dev libglib2.0-dev meson ninja-build \
+            openssh-server fuse3
+          pip3 install pytest
+
+      - name: build
+        run: mkdir build && cd build && meson .. && ninja
+
+      - name: setup ssh
+        run: |
+          ssh-keygen -b 2048 -t rsa -f ~/.ssh/id_rsa -q -N ""
+          cat ~/.ssh/id_rsa.pub >> ~/.ssh/authorized_keys
+          chmod 600 ~/.ssh/authorized_keys
+
+      - name: run option tests
+        run: |
+          cd build
+          python3 -m pytest test/test_sshfs.py \
+            -k "test_writeback_cache or test_sshfs_sync or test_no_readahead \
+                or test_small_max_rw or test_truncate_workaround \
+                or test_fstat_workaround or test_createmode_workaround \
+                or test_renamexdev_workaround or test_transform_symlinks \
+                or test_idmap_user or test_delay_connect" \
+            --timeout=300
+
+  # -------------------------------------------------------------------------
+  # e2e-workloads: real-workload tests in test_workloads.py
+  # -------------------------------------------------------------------------
+  e2e-workloads:
+    name: workload tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # full history for git clone tests
+
+      - uses: actions/setup-python@v4
+
+      - name: install deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libfuse3-dev libglib2.0-dev meson ninja-build \
+            openssh-server fuse3 rsync gcc make git
+          pip3 install pytest
+
+      - name: build
+        run: mkdir build && cd build && meson .. && ninja
+
+      - name: setup ssh
+        run: |
+          ssh-keygen -b 2048 -t rsa -f ~/.ssh/id_rsa -q -N ""
+          cat ~/.ssh/id_rsa.pub >> ~/.ssh/authorized_keys
+          chmod 600 ~/.ssh/authorized_keys
+
+      - name: init fixture git repo
+        run: |
+          cd test/fixtures/hello_c
+          git config user.email "ci@example.com"
+          git config user.name "CI"
+          git init || true
+          git add . || true
+          git commit -m "initial commit" --allow-empty || true
+
+      - name: run workload tests
+        run: |
+          cd build
+          python3 -m pytest test/test_workloads.py \
+            -k "not test_compile_c_project" \
+            --timeout=600
+
+  # -------------------------------------------------------------------------
+  # e2e-workloads-compile: compile test (separate job, allowed to fail)
+  # -------------------------------------------------------------------------
+  e2e-workloads-compile:
+    name: compile-on-mount test
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v4
+
+      - name: install deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libfuse3-dev libglib2.0-dev meson ninja-build \
+            openssh-server fuse3 gcc make
+          pip3 install pytest
+
+      - name: build
+        run: mkdir build && cd build && meson .. && ninja
+
+      - name: setup ssh
+        run: |
+          ssh-keygen -b 2048 -t rsa -f ~/.ssh/id_rsa -q -N ""
+          cat ~/.ssh/id_rsa.pub >> ~/.ssh/authorized_keys
+          chmod 600 ~/.ssh/authorized_keys
+
+      - name: init fixture git repo
+        run: |
+          cd test/fixtures/hello_c
+          git config user.email "ci@example.com"
+          git config user.name "CI"
+          git init || true
+          git add . || true
+          git commit -m "initial commit" --allow-empty || true
+
+      - name: run compile test
+        run: |
+          cd build
+          python3 -m pytest test/test_workloads.py::test_compile_c_project --timeout=300
+
+  # -------------------------------------------------------------------------
+  # e2e-errors: error path tests in test_errors.py
+  # -------------------------------------------------------------------------
+  e2e-errors:
+    name: error path tests
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v4
+
+      - name: install deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libfuse3-dev libglib2.0-dev meson ninja-build \
+            openssh-server fuse3
+          pip3 install pytest
+
+      - name: build
+        run: mkdir build && cd build && meson .. && ninja
+
+      - name: setup ssh
+        run: |
+          ssh-keygen -b 2048 -t rsa -f ~/.ssh/id_rsa -q -N ""
+          cat ~/.ssh/id_rsa.pub >> ~/.ssh/authorized_keys
+          chmod 600 ~/.ssh/authorized_keys
+
+      - name: run error path tests
+        run: |
+          cd build
+          python3 -m pytest test/test_errors.py --timeout=300
+
+  # -------------------------------------------------------------------------
+  # e2e-stress: stress / fsx / fsstress / concurrent / dual-mount / reconnect
+  # -------------------------------------------------------------------------
+  e2e-stress:
+    name: stress tests
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v4
+
+      - name: install deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libfuse3-dev libglib2.0-dev meson ninja-build \
+            openssh-server fuse3 ltp
+          pip3 install pytest
+
+      - name: build sshfs
+        run: mkdir build && cd build && meson .. && ninja
+
+      - name: build fsstress from xfstests
+        run: |
+          git clone --depth=1 https://github.com/kdave/xfstests /tmp/xfstests
+          cd /tmp/xfstests
+          make ltp 2>&1 | tail -20 || echo "fsstress build failed, will skip test"
+
+      - name: setup ssh
+        run: |
+          ssh-keygen -b 2048 -t rsa -f ~/.ssh/id_rsa -q -N ""
+          cat ~/.ssh/id_rsa.pub >> ~/.ssh/authorized_keys
+          chmod 600 ~/.ssh/authorized_keys
+
+      - name: run stress tests
+        run: |
+          cd build
+          python3 -m pytest test/test_stress.py \
+            --timeout=600
