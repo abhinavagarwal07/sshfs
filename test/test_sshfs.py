@@ -803,3 +803,129 @@ def test_direct_io(tmpdir, capfd):
         raise
     else:
         umount(mount_process, mnt_dir)
+
+
+def test_rsync_archive(tmpdir, capfd):
+    capfd.register_output(r"^Warning: Permanently added 'localhost' .+", count=0)
+    mount_process, mnt_dir, src_dir = _mount_sshfs(tmpdir)
+    try:
+        # Build a small source tree to sync (a few files across subdirs)
+        fixture_dir = pjoin(os.path.dirname(__file__), "fixtures", "hello_c")
+        if os.path.isdir(fixture_dir):
+            source = fixture_dir
+        else:
+            source = str(tmpdir.mkdir("rsync_source"))
+            os.makedirs(pjoin(source, "sub"), exist_ok=True)
+            files = [
+                ("file_a.txt", b"alpha\n"),
+                ("file_b.txt", b"beta\n"),
+                (pjoin("sub", "file_c.txt"), b"gamma\n"),
+                (pjoin("sub", "file_d.txt"), b"delta\n"),
+                ("file_e.txt", b"epsilon\n"),
+            ]
+            for rel, data in files:
+                with open(pjoin(source, rel), "wb") as fh:
+                    fh.write(data)
+
+        dest = pjoin(mnt_dir, "rsync_dest")
+        os.makedirs(dest, exist_ok=True)
+
+        subprocess.check_call(
+            ["rsync", "-a", "--checksum", source + "/", dest + "/"]
+        )
+
+        ret = subprocess.call(
+            ["diff", "-r", "--no-dereference", source + "/", dest + "/"]
+        )
+        assert ret == 0, "rsync'd tree differs from source"
+    except:
+        cleanup(mount_process, mnt_dir)
+        raise
+    else:
+        umount(mount_process, mnt_dir)
+
+
+def test_tar_roundtrip(tmpdir, capfd):
+    capfd.register_output(r"^Warning: Permanently added 'localhost' .+", count=0)
+    mount_process, mnt_dir, src_dir = _mount_sshfs(tmpdir)
+    try:
+        # Create source files in the server-side backing store
+        tree_name = "tar_source"
+        tree_root = pjoin(src_dir, tree_name)
+        os.makedirs(pjoin(tree_root, "subdir"), exist_ok=True)
+        files = [
+            ("readme.txt", b"tar round-trip test\n"),
+            ("data.bin", b"\x00\x01\x02\x03" * 256),
+            (pjoin("subdir", "nested.txt"), b"nested file content\n"),
+        ]
+        for rel, data in files:
+            with open(pjoin(tree_root, rel), "wb") as fh:
+                fh.write(data)
+
+        # Create archive via the mount
+        archive = pjoin(mnt_dir, "archive.tar.gz")
+        subprocess.check_call(
+            ["tar", "czf", archive, "-C", src_dir, tree_name]
+        )
+
+        # Extract via the mount
+        extract_dir = pjoin(mnt_dir, "extracted")
+        os.makedirs(extract_dir, exist_ok=True)
+        subprocess.check_call(["tar", "xzf", archive, "-C", extract_dir])
+
+        ret = subprocess.call(
+            ["diff", "-r", tree_root, pjoin(extract_dir, tree_name)]
+        )
+        assert ret == 0, "tar round-trip produced different tree"
+    except:
+        cleanup(mount_process, mnt_dir)
+        raise
+    else:
+        umount(mount_process, mnt_dir)
+
+
+def test_find_grep(tmpdir, capfd):
+    capfd.register_output(r"^Warning: Permanently added 'localhost' .+", count=0)
+    mount_process, mnt_dir, src_dir = _mount_sshfs(tmpdir)
+    try:
+        num_dirs = 50
+        num_files = 1000
+        needle_interval = 10  # every 10th file contains "needle"
+
+        # Create directory tree in the backing store (faster than going through mount)
+        for d in range(num_dirs):
+            os.makedirs(pjoin(src_dir, f"dir_{d:03d}"), exist_ok=True)
+
+        for i in range(num_files):
+            dir_name = f"dir_{i % num_dirs:03d}"
+            file_name = f"file_{i:04d}.txt"
+            if i % needle_interval == 0:
+                content = f"needle in file {i}\n".encode()
+            else:
+                content = f"haystack data in file {i}\n".encode()
+            with open(pjoin(src_dir, dir_name, file_name), "wb") as fh:
+                fh.write(content)
+
+        # find via mount — count .txt files
+        find_out = subprocess.check_output(
+            ["find", mnt_dir, "-name", "*.txt", "-type", "f"]
+        )
+        found_files = sorted(line for line in find_out.decode().splitlines() if line)
+        assert len(found_files) == num_files, (
+            f"find returned {len(found_files)} files, expected {num_files}"
+        )
+
+        # grep via mount — count needle matches
+        grep_out = subprocess.check_output(
+            ["grep", "-r", "needle", mnt_dir], stderr=subprocess.DEVNULL
+        )
+        needle_lines = [l for l in grep_out.decode().splitlines() if l]
+        expected_needles = num_files // needle_interval
+        assert len(needle_lines) == expected_needles, (
+            f"grep found {len(needle_lines)} needle lines, expected {expected_needles}"
+        )
+    except:
+        cleanup(mount_process, mnt_dir)
+        raise
+    else:
+        umount(mount_process, mnt_dir)
