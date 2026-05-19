@@ -968,6 +968,207 @@ def test_sshd_kill_no_reconnect(tmpdir, capfd):
                 sshd_proc.kill()
 
 
+def test_sshd_kill_reconnect(tmpdir, capfd):
+    capfd.register_output(r"^Warning: Permanently added .+", count=0)
+    capfd.register_output(r"read: Connection reset by peer", count=0)
+    capfd.register_output(r"ssh_dispatch_run_fatal", count=0)
+    capfd.register_output(r"Connection to .+ closed", count=0)
+    capfd.register_output(r"Broken pipe", count=0)
+    capfd.register_output(r"remote host has disconnected", count=0)
+    capfd.register_output(r"reconnect", count=0)
+
+    if not shutil.which("sshd") and not os.path.isfile("/usr/sbin/sshd"):
+        pytest.skip("sshd not available")
+    sshd_path = shutil.which("sshd") or "/usr/sbin/sshd"
+
+    # Find sftp-server for the sshd Subsystem line
+    sftp_server_path = None
+    for candidate in [
+        "/usr/lib/openssh/sftp-server",
+        "/usr/libexec/sftp-server",
+        "/usr/lib/ssh/sftp-server",
+        "/usr/libexec/openssh/sftp-server",
+    ]:
+        if os.path.isfile(candidate):
+            sftp_server_path = candidate
+            break
+    if sftp_server_path is None:
+        sftp_server_path = shutil.which("sftp-server")
+    if sftp_server_path is None:
+        pytest.skip("sftp-server not found; cannot configure test sshd")
+
+    key_dir = str(tmpdir.mkdir("keys"))
+    host_key = pjoin(key_dir, "host_key")
+    client_key = pjoin(key_dir, "client_key")
+    auth_keys = pjoin(key_dir, "authorized_keys")
+    sshd_config_path = pjoin(key_dir, "sshd_config")
+    src_dir = str(tmpdir.mkdir("src_reconnect"))
+    mnt_dir = str(tmpdir.mkdir("mnt_reconnect"))
+
+    subprocess.check_call(["ssh-keygen", "-t", "ed25519", "-N", "", "-f", host_key],
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    subprocess.check_call(["ssh-keygen", "-t", "ed25519", "-N", "", "-f", client_key],
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    with open(client_key + ".pub") as f:
+        pub = f.read()
+    with open(auth_keys, "w") as f:
+        f.write(pub)
+    os.chmod(auth_keys, 0o600)
+
+    # Write sshd_config — Subsystem line is required for sftp/sshfs to work
+    with open(sshd_config_path, "w") as f:
+        f.write(
+            f"Port 2223\n"
+            f"ListenAddress 127.0.0.1\n"
+            f"HostKey {host_key}\n"
+            f"AuthorizedKeysFile {auth_keys}\n"
+            f"StrictModes no\n"
+            f"UsePAM no\n"
+            f"PasswordAuthentication no\n"
+            f"PubkeyAuthentication yes\n"
+            f"LogLevel DEBUG\n"
+            f"PidFile {pjoin(key_dir, 'sshd.pid')}\n"
+            f"Subsystem sftp {sftp_server_path}\n"
+        )
+
+    def _start_sshd():
+        # Try without sudo first (works on GHA where the runner can bind
+        # ports >1024), then fall back to sudo.
+        for cmd in [
+            [sshd_path, "-f", sshd_config_path, "-D"],
+            ["sudo", sshd_path, "-f", sshd_config_path, "-D"],
+        ]:
+            proc = subprocess.Popen(
+                cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+            # Wait up to 3s for the daemon to become ready by probing the port.
+            deadline = time.time() + 3.0
+            ready = False
+            while time.time() < deadline:
+                if proc.poll() is not None:
+                    break  # process already exited — wrong cmd, try next
+                try:
+                    r = subprocess.run(
+                        [
+                            "ssh", "-p", "2223",
+                            "-i", client_key,
+                            "-o", "StrictHostKeyChecking=no",
+                            "-o", "UserKnownHostsFile=/dev/null",
+                            "-o", "BatchMode=yes",
+                            "-o", "ConnectTimeout=1",
+                            "localhost", "true",
+                        ],
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                        timeout=2,
+                    )
+                    if r.returncode == 0:
+                        ready = True
+                        break
+                except subprocess.TimeoutExpired:
+                    pass
+                time.sleep(0.2)
+            if ready:
+                return proc
+            # Daemon didn't become ready; kill it and try next command variant.
+            proc.terminate()
+            try:
+                proc.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+        return None
+
+    sshd_proc = _start_sshd()
+    if sshd_proc is None:
+        pytest.skip("could not start secondary sshd on port 2223")
+
+    mount_process = None
+    try:
+        cmdline = base_cmdline + [
+            pjoin(basename, "sshfs"),
+            "-f",
+            f"localhost:{src_dir}",
+            mnt_dir,
+            "-p", "2223",
+            "-o", "entry_timeout=0",
+            "-o", "attr_timeout=0",
+            "-o", "dir_cache=no",
+            "-o", "reconnect",
+            "-o", "StrictHostKeyChecking=no",
+            "-o", "UserKnownHostsFile=/dev/null",
+            "-o", f"IdentityFile={client_key}",
+            "-o", "PasswordAuthentication=no",
+            "-o", "BatchMode=yes",
+            "-o", "ConnectTimeout=5",
+            "-o", "ServerAliveInterval=2",
+            "-o", "ServerAliveCountMax=2",
+        ]
+        new_env = dict(os.environ)
+        new_env["G_DEBUG"] = "fatal-warnings"
+        mount_process = subprocess.Popen(cmdline, env=new_env)
+
+        try:
+            wait_for_mount(mount_process, mnt_dir)
+        except Exception:
+            cleanup(mount_process, mnt_dir)
+            mount_process = None
+            raise
+
+        # Verify mount works before kill
+        with open(pjoin(mnt_dir, "pre_kill"), "wb") as f:
+            f.write(b"before kill")
+
+        # Kill sshd
+        sshd_proc.terminate()
+        sshd_proc.wait(timeout=5)
+
+        # Wait a moment, then restart
+        time.sleep(1)
+        sshd_proc = _start_sshd()
+        assert sshd_proc is not None, "failed to restart sshd"
+        time.sleep(1)
+
+        # Retry operations until reconnect succeeds (up to 15s)
+        post_kill = pjoin(mnt_dir, "post_kill")
+        deadline = time.time() + 15
+        last_exc = None
+        while time.time() < deadline:
+            try:
+                with open(post_kill, "wb") as f:
+                    f.write(b"after reconnect")
+                last_exc = None
+                break
+            except OSError as e:
+                last_exc = e
+                time.sleep(0.5)
+
+        if last_exc is not None:
+            pytest.fail(f"sshfs did not reconnect within 15s: {last_exc}")
+
+        with open(post_kill, "rb") as f:
+            assert f.read() == b"after reconnect"
+
+    except Exception:
+        if mount_process is not None:
+            subprocess.call(["fusermount3", "-z", "-u", mnt_dir],
+                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            if mount_process.poll() is None:
+                mount_process.terminate()
+                try:
+                    mount_process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    mount_process.kill()
+        raise
+    else:
+        umount(mount_process, mnt_dir)
+    finally:
+        if sshd_proc is not None and sshd_proc.poll() is None:
+            sshd_proc.terminate()
+            try:
+                sshd_proc.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                sshd_proc.kill()
+
+
 def test_direct_io(tmpdir, capfd):
     capfd.register_output(r"^Warning: Permanently added 'localhost' .+", count=0)
     mount_process, mnt_dir, src_dir = _mount_sshfs(tmpdir, ["direct_io"])
