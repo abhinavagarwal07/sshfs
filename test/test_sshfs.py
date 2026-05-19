@@ -9,6 +9,7 @@ if __name__ == "__main__":
 import subprocess
 import os
 import sys
+import time
 import pytest
 import stat
 import shutil
@@ -789,8 +790,6 @@ def test_sshd_kill_no_reconnect(tmpdir, capfd):
     capfd.register_output(r"Broken pipe", count=0)
     capfd.register_output(r"remote host has disconnected", count=0)
 
-    import time
-
     if not shutil.which("sshd") and not os.path.isfile("/usr/sbin/sshd"):
         pytest.skip("sshd not available")
     sshd_path = shutil.which("sshd") or "/usr/sbin/sshd"
@@ -924,7 +923,7 @@ def test_sshd_kill_no_reconnect(tmpdir, capfd):
 
         try:
             wait_for_mount(mount_process, mnt_dir)
-        except:
+        except Exception:
             sshd_proc.terminate()
             cleanup(mount_process, mnt_dir)
             raise
@@ -977,8 +976,6 @@ def test_sshd_kill_reconnect(tmpdir, capfd):
     capfd.register_output(r"Broken pipe", count=0)
     capfd.register_output(r"remote host has disconnected", count=0)
     capfd.register_output(r"reconnect", count=0)
-
-    import time
 
     if not shutil.which("sshd") and not os.path.isfile("/usr/sbin/sshd"):
         pytest.skip("sshd not available")
@@ -1111,7 +1108,7 @@ def test_sshd_kill_reconnect(tmpdir, capfd):
 
         try:
             wait_for_mount(mount_process, mnt_dir)
-        except:
+        except Exception:
             cleanup(mount_process, mnt_dir)
             mount_process = None
             raise
@@ -1150,7 +1147,7 @@ def test_sshd_kill_reconnect(tmpdir, capfd):
         with open(post_kill, "rb") as f:
             assert f.read() == b"after reconnect"
 
-    except:
+    except Exception:
         if mount_process is not None:
             subprocess.call(["fusermount3", "-z", "-u", mnt_dir],
                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
