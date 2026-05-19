@@ -803,3 +803,73 @@ def test_direct_io(tmpdir, capfd):
         raise
     else:
         umount(mount_process, mnt_dir)
+
+
+def test_writeback_cache(tmpdir, capfd):
+    capfd.register_output(r"^Warning: Permanently added 'localhost' .+", count=0)
+    # Suppress the FUSE "unknown option" error that sshfs prints to stderr when
+    # writeback_cache is not supported by the running kernel/libfuse version.
+    capfd.register_output(r"fuse:.*unknown option", count=0)
+    capfd.register_output(r"unknown option.*writeback_cache", count=0)
+
+    # Try to mount with writeback_cache — may fail on older kernels
+    try:
+        mount_process, mnt_dir, src_dir = _mount_sshfs(tmpdir, ['writeback_cache'])
+    except BaseException:
+        pytest.skip("writeback_cache not supported on this FUSE/kernel version")
+
+    try:
+        # Sub-test 1: Truncate-after-write (issue #81)
+        # Write 8KB, truncate to 4KB, close, reopen, verify size is 4KB
+        path = pjoin(mnt_dir, "trunc_test")
+        with open(path, "wb") as f:
+            f.write(b"A" * 8192)
+        os.truncate(path, 4096)
+        st = os.stat(path)
+        assert st.st_size == 4096, f"expected 4096 after truncate, got {st.st_size}"
+        with open(path, "rb") as f:
+            data = f.read()
+        assert len(data) == 4096, f"read back {len(data)} bytes, expected 4096"
+
+        # Sub-test 2: fstat-after-write (issue #93)
+        # Write N bytes, check size without closing
+        path2 = pjoin(mnt_dir, "fstat_test")
+        fd = os.open(path2, os.O_WRONLY | os.O_CREAT | os.O_TRUNC)
+        try:
+            os.write(fd, b"B" * 5000)
+            os.fsync(fd)  # flush to ensure write reaches server
+            st = os.fstat(fd)
+            # With writeback_cache, fstat may return stale size.
+            # We sync first, so size should be correct.
+            assert st.st_size == 5000, (
+                f"fstat after write+fsync: expected 5000, got {st.st_size}"
+            )
+        finally:
+            os.close(fd)
+
+        # Sub-test 3: Overlapping writes from two fds
+        path3 = pjoin(mnt_dir, "overlap_test")
+        with open(path3, "wb") as f:
+            f.write(b"\x00" * 1024)
+
+        fd1 = os.open(path3, os.O_WRONLY)
+        fd2 = os.open(path3, os.O_WRONLY)
+        try:
+            os.write(fd1, b"X" * 512)
+            os.write(fd2, b"Y" * 512)
+        finally:
+            os.close(fd1)
+            os.close(fd2)
+
+        with open(path3, "rb") as f:
+            data = f.read(512)
+        # Content should be either all X or all Y (last writer wins), not garbage
+        assert data == b"X" * 512 or data == b"Y" * 512, (
+            f"overlapping write produced garbage: {data[:20]!r}..."
+        )
+
+    except Exception:
+        cleanup(mount_process, mnt_dir)
+        raise
+    else:
+        umount(mount_process, mnt_dir)
