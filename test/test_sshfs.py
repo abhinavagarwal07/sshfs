@@ -25,6 +25,8 @@ from util import (
     safe_sleep,
     os_create,
     os_open,
+    _check_ssh_localhost,
+    _mount_sshfs,
 )
 from os.path import join as pjoin
 
@@ -708,56 +710,6 @@ def tst_passthrough(src_dir, mnt_dir, cache_timeout):
     assert abs(src_st.st_mtime - mnt_st.st_mtime) <= 1
 
 
-def _check_ssh_localhost():
-    try:
-        res = subprocess.call(
-            ["ssh", "-o", "StrictHostKeyChecking=no",
-             "-o", "KbdInteractiveAuthentication=no",
-             "-o", "ChallengeResponseAuthentication=no",
-             "-o", "PasswordAuthentication=no",
-             "localhost", "--", "true"],
-            stdin=subprocess.DEVNULL, timeout=10,
-        )
-    except subprocess.TimeoutExpired:
-        res = 1
-    if res != 0:
-        pytest.fail("Unable to ssh into localhost without password prompt.")
-
-
-_mount_ctr = [0]
-
-
-def _mount_sshfs(tmpdir, extra_opts=None):
-    """Helper to mount sshfs with custom options. Returns (mount_process, mnt_dir, src_dir)."""
-    _check_ssh_localhost()
-    _mount_ctr[0] += 1
-    mnt_dir = str(tmpdir.mkdir(f"mnt{_mount_ctr[0]}"))
-    src_dir = str(tmpdir.mkdir(f"src{_mount_ctr[0]}"))
-
-    cmdline = base_cmdline + [
-        pjoin(basename, "sshfs"),
-        "-f",
-        f"localhost:{src_dir}",
-        mnt_dir,
-        "-o", "entry_timeout=0",
-        "-o", "attr_timeout=0",
-    ]
-    if extra_opts:
-        for opt in extra_opts:
-            cmdline += ["-o", opt]
-
-    new_env = dict(os.environ)
-    new_env["G_DEBUG"] = "fatal-warnings"
-
-    mount_process = subprocess.Popen(cmdline, env=new_env)
-    try:
-        wait_for_mount(mount_process, mnt_dir)
-    except:
-        cleanup(mount_process, mnt_dir)
-        raise
-    return mount_process, mnt_dir, src_dir
-
-
 def test_disable_hardlink(tmpdir, capfd):
     capfd.register_output(r"^Warning: Permanently added 'localhost' .+", count=0)
 
@@ -846,6 +798,289 @@ def test_direct_io(tmpdir, capfd):
             assert fh.read() == data
 
         os.unlink(mnt_name)
+    except Exception:
+        cleanup(mount_process, mnt_dir)
+        raise
+    else:
+        umount(mount_process, mnt_dir)
+
+
+def test_writeback_cache(tmpdir, capfd):
+    capfd.register_output(r"^Warning: Permanently added 'localhost' .+", count=0)
+    mount_process, mnt_dir, src_dir = _mount_sshfs(
+        tmpdir, ["writeback_cache", "dir_cache=no"]
+    )
+    try:
+        # Sub-test 1: truncate-after-write (regression test for issues #81, #88)
+        path = pjoin(mnt_dir, name_generator())
+        data = b"x" * 8192
+        with open(path, "wb") as fh:
+            fh.write(data)
+        os.truncate(path, 4096)
+        with open(path, "rb") as fh:
+            content = fh.read()
+        assert len(content) == 4096, f"expected 4096 bytes after truncate, got {len(content)}"
+        assert content == data[:4096]
+        os.unlink(path)
+
+        # Sub-test 2: fstat-after-write (regression test for issue #93)
+        path = pjoin(mnt_dir, name_generator())
+        payload = b"y" * 4096
+        fd = os.open(path, os.O_CREAT | os.O_WRONLY)
+        try:
+            os.write(fd, payload)
+            os.fsync(fd)
+            fst = os.fstat(fd)
+            assert fst.st_size == len(payload), (
+                f"fstat after write returned {fst.st_size}, expected {len(payload)}"
+            )
+        finally:
+            os.close(fd)
+        os.unlink(path)
+
+        # Sub-test 3: overlapping writes with two O_WRONLY fds
+        path = pjoin(mnt_dir, name_generator())
+        half = 4096
+        data_a = b"A" * half
+        data_b = b"B" * half
+        fd_a = os.open(path, os.O_CREAT | os.O_WRONLY)
+        fd_b = os.open(path, os.O_WRONLY)
+        try:
+            os.write(fd_a, data_a)
+            os.lseek(fd_b, half, os.SEEK_SET)
+            os.write(fd_b, data_b)
+        finally:
+            os.close(fd_a)
+            os.close(fd_b)
+        with open(path, "rb") as fh:
+            result = fh.read()
+        assert len(result) == half * 2, f"expected {half * 2} bytes, got {len(result)}"
+        assert result[:half] == data_a
+        assert result[half:] == data_b
+        os.unlink(path)
+
+        # Run standard tests to make sure writeback_cache doesn't break basic ops
+        tst_open_read(src_dir, mnt_dir)
+        tst_open_write(src_dir, mnt_dir)
+        tst_truncate_path(mnt_dir)
+        tst_truncate_fd(mnt_dir)
+    except Exception:
+        cleanup(mount_process, mnt_dir)
+        raise
+    else:
+        umount(mount_process, mnt_dir)
+
+
+def test_sshfs_sync(tmpdir, capfd):
+    capfd.register_output(r"^Warning: Permanently added 'localhost' .+", count=0)
+    mount_process, mnt_dir, src_dir = _mount_sshfs(tmpdir, ["sshfs_sync"])
+    try:
+        tst_open_read(src_dir, mnt_dir)
+        tst_open_write(src_dir, mnt_dir)
+        tst_append(src_dir, mnt_dir)
+        tst_seek(src_dir, mnt_dir)
+        tst_truncate_path(mnt_dir)
+        tst_truncate_fd(mnt_dir)
+        tst_fsync(src_dir, mnt_dir)
+    except Exception:
+        cleanup(mount_process, mnt_dir)
+        raise
+    else:
+        umount(mount_process, mnt_dir)
+
+
+def test_no_readahead(tmpdir, capfd):
+    capfd.register_output(r"^Warning: Permanently added 'localhost' .+", count=0)
+    mount_process, mnt_dir, src_dir = _mount_sshfs(tmpdir, ["no_readahead"])
+    try:
+        tst_open_read(src_dir, mnt_dir)
+        tst_open_write(src_dir, mnt_dir)
+        tst_seek(src_dir, mnt_dir)
+        tst_truncate_path(mnt_dir)
+        tst_truncate_fd(mnt_dir)
+    except Exception:
+        cleanup(mount_process, mnt_dir)
+        raise
+    else:
+        umount(mount_process, mnt_dir)
+
+
+def test_small_max_rw(tmpdir, capfd):
+    capfd.register_output(r"^Warning: Permanently added 'localhost' .+", count=0)
+    mount_process, mnt_dir, src_dir = _mount_sshfs(
+        tmpdir, ["max_read=4096", "max_write=4096"]
+    )
+    try:
+        # Write a file larger than the chunk size to exercise the chunking loop
+        path = pjoin(mnt_dir, name_generator())
+        data = os.urandom(64 * 1024)
+        with open(path, "wb") as fh:
+            fh.write(data)
+        with open(path, "rb") as fh:
+            assert fh.read() == data
+        os.unlink(path)
+
+        tst_open_read(src_dir, mnt_dir)
+        tst_open_write(src_dir, mnt_dir)
+        tst_truncate_path(mnt_dir)
+    except Exception:
+        cleanup(mount_process, mnt_dir)
+        raise
+    else:
+        umount(mount_process, mnt_dir)
+
+
+def test_truncate_workaround(tmpdir, capfd):
+    capfd.register_output(r"^Warning: Permanently added 'localhost' .+", count=0)
+    mount_process, mnt_dir, src_dir = _mount_sshfs(
+        tmpdir, ["workaround=truncate"]
+    )
+    try:
+        tst_truncate_path(mnt_dir)
+        tst_truncate_fd(mnt_dir)
+    except Exception:
+        cleanup(mount_process, mnt_dir)
+        raise
+    else:
+        umount(mount_process, mnt_dir)
+
+
+def test_fstat_workaround(tmpdir, capfd):
+    capfd.register_output(r"^Warning: Permanently added 'localhost' .+", count=0)
+    mount_process, mnt_dir, src_dir = _mount_sshfs(
+        tmpdir, ["workaround=fstat"]
+    )
+    try:
+        tst_truncate_fd(mnt_dir)
+        tst_fsync(src_dir, mnt_dir)
+    except Exception:
+        cleanup(mount_process, mnt_dir)
+        raise
+    else:
+        umount(mount_process, mnt_dir)
+
+
+def test_createmode_workaround(tmpdir, capfd):
+    capfd.register_output(r"^Warning: Permanently added 'localhost' .+", count=0)
+    mount_process, mnt_dir, src_dir = _mount_sshfs(
+        tmpdir, ["workaround=createmode"]
+    )
+    try:
+        # Create a file with mode 0o644, verify it's preserved
+        path = pjoin(mnt_dir, name_generator())
+        fd = os.open(path, os.O_CREAT | os.O_WRONLY, 0o644)
+        os.close(fd)
+        fst = os.stat(path)
+        assert stat.S_IMODE(fst.st_mode) == 0o644, (
+            f"expected mode 0o644, got {oct(stat.S_IMODE(fst.st_mode))}"
+        )
+        os.unlink(path)
+
+        # Create a file with mode 0o755, verify it's preserved
+        path = pjoin(mnt_dir, name_generator())
+        fd = os.open(path, os.O_CREAT | os.O_WRONLY, 0o755)
+        os.close(fd)
+        fst = os.stat(path)
+        assert stat.S_IMODE(fst.st_mode) == 0o755, (
+            f"expected mode 0o755, got {oct(stat.S_IMODE(fst.st_mode))}"
+        )
+        os.unlink(path)
+    except Exception:
+        cleanup(mount_process, mnt_dir)
+        raise
+    else:
+        umount(mount_process, mnt_dir)
+
+
+def test_renamexdev_workaround(tmpdir, capfd):
+    capfd.register_output(r"^Warning: Permanently added 'localhost' .+", count=0)
+    mount_process, mnt_dir, src_dir = _mount_sshfs(
+        tmpdir, ["workaround=renamexdev"]
+    )
+    try:
+        # Verify the workaround doesn't break normal rename
+        tst_rename(mnt_dir)
+        tst_rename_over(mnt_dir)
+    except Exception:
+        cleanup(mount_process, mnt_dir)
+        raise
+    else:
+        umount(mount_process, mnt_dir)
+
+
+def test_transform_symlinks(tmpdir, capfd):
+    capfd.register_output(r"^Warning: Permanently added 'localhost' .+", count=0)
+    mount_process, mnt_dir, src_dir = _mount_sshfs(
+        tmpdir, ["transform_symlinks"]
+    )
+    try:
+        # Create a file on the server side
+        target_name = name_generator()
+        target = pjoin(src_dir, target_name)
+        with open(target, "wb") as fh:
+            fh.write(b"transform symlinks test")
+
+        # Create an absolute symlink on the server side
+        link_name = name_generator()
+        abs_target = pjoin(src_dir, target_name)
+        os.symlink(abs_target, pjoin(src_dir, link_name))
+
+        # Through the mount, readlink should return a relative path, not the
+        # original absolute path
+        mnt_link = pjoin(mnt_dir, link_name)
+        link_dest = os.readlink(mnt_link)
+        assert not os.path.isabs(link_dest), (
+            f"transform_symlinks should convert absolute symlinks to relative, "
+            f"but got: {link_dest!r}"
+        )
+
+        os.unlink(pjoin(src_dir, link_name))
+        os.unlink(target)
+    except Exception:
+        cleanup(mount_process, mnt_dir)
+        raise
+    else:
+        umount(mount_process, mnt_dir)
+
+
+def test_idmap_user(tmpdir, capfd):
+    capfd.register_output(r"^Warning: Permanently added 'localhost' .+", count=0)
+    mount_process, mnt_dir, src_dir = _mount_sshfs(tmpdir, ["idmap=user"])
+    try:
+        path = pjoin(src_dir, name_generator())
+        with open(path, "wb") as fh:
+            fh.write(b"idmap test")
+
+        mnt_path = pjoin(mnt_dir, os.path.basename(path))
+        fst = os.stat(mnt_path)
+        assert fst.st_uid == os.getuid(), (
+            f"expected st_uid {os.getuid()}, got {fst.st_uid}"
+        )
+        assert fst.st_gid == os.getgid(), (
+            f"expected st_gid {os.getgid()}, got {fst.st_gid}"
+        )
+        os.unlink(path)
+    except Exception:
+        cleanup(mount_process, mnt_dir)
+        raise
+    else:
+        umount(mount_process, mnt_dir)
+
+
+def test_delay_connect(tmpdir, capfd):
+    capfd.register_output(r"^Warning: Permanently added 'localhost' .+", count=0)
+    mount_process, mnt_dir, src_dir = _mount_sshfs(tmpdir, ["delay_connect"])
+    try:
+        # Basic file create + write + read verifies lazy connection establishment works
+        path = pjoin(mnt_dir, name_generator())
+        data = b"delay_connect test data"
+        with open(path, "wb") as fh:
+            fh.write(data)
+        with open(path, "rb") as fh:
+            assert fh.read() == data
+        fst = os.stat(path)
+        assert fst.st_size == len(data)
+        os.unlink(path)
     except Exception:
         cleanup(mount_process, mnt_dir)
         raise
