@@ -807,11 +807,15 @@ def test_direct_io(tmpdir, capfd):
 
 def test_writeback_cache(tmpdir, capfd):
     capfd.register_output(r"^Warning: Permanently added 'localhost' .+", count=0)
+    # Suppress the FUSE "unknown option" error that sshfs prints to stderr when
+    # writeback_cache is not supported by the running kernel/libfuse version.
+    capfd.register_output(r"fuse:.*unknown option", count=0)
+    capfd.register_output(r"unknown option.*writeback_cache", count=0)
 
     # Try to mount with writeback_cache — may fail on older kernels
     try:
         mount_process, mnt_dir, src_dir = _mount_sshfs(tmpdir, ['writeback_cache'])
-    except Exception:
+    except BaseException:
         pytest.skip("writeback_cache not supported on this FUSE/kernel version")
 
     try:
@@ -864,7 +868,7 @@ def test_writeback_cache(tmpdir, capfd):
             f"overlapping write produced garbage: {data[:20]!r}..."
         )
 
-    except:
+    except Exception:
         cleanup(mount_process, mnt_dir)
         raise
     else:
