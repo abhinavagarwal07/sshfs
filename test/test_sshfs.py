@@ -807,6 +807,7 @@ def test_direct_io(tmpdir, capfd):
 
 def test_truncate_workaround(tmpdir, capfd):
     capfd.register_output(r"^Warning: Permanently added 'localhost' .+", count=0)
+    # Smoke test: verify truncate still works with the workaround enabled
     mount_process, mnt_dir, src_dir = _mount_sshfs(tmpdir, ["workaround=truncate"])
     try:
         tst_truncate_path(mnt_dir)
@@ -820,6 +821,7 @@ def test_truncate_workaround(tmpdir, capfd):
 
 def test_fstat_workaround(tmpdir, capfd):
     capfd.register_output(r"^Warning: Permanently added 'localhost' .+", count=0)
+    # Smoke test: verify fsync still works with the fstat workaround enabled
     mount_process, mnt_dir, src_dir = _mount_sshfs(tmpdir, ["workaround=fstat"])
     try:
         tst_truncate_fd(mnt_dir)
@@ -833,6 +835,7 @@ def test_fstat_workaround(tmpdir, capfd):
 
 def test_createmode_workaround(tmpdir, capfd):
     capfd.register_output(r"^Warning: Permanently added 'localhost' .+", count=0)
+    # Smoke test: verify chmod still works with the createmode workaround enabled
     mount_process, mnt_dir, src_dir = _mount_sshfs(tmpdir, ["workaround=createmode"])
     try:
         filename = pjoin(mnt_dir, name_generator())
@@ -859,6 +862,7 @@ def test_createmode_workaround(tmpdir, capfd):
 
 def test_renamexdev_workaround(tmpdir, capfd):
     capfd.register_output(r"^Warning: Permanently added 'localhost' .+", count=0)
+    # Smoke test: verify rename still works with the renamexdev workaround enabled
     mount_process, mnt_dir, src_dir = _mount_sshfs(tmpdir, ["workaround=renamexdev"])
     try:
         tst_rename(mnt_dir)
@@ -891,6 +895,7 @@ def test_transform_symlinks(tmpdir, capfd):
         assert not os.path.isabs(link_val), (
             f"expected a relative path but got: {link_val!r}"
         )
+        assert link_val == "subdir/target", f"expected 'subdir/target' but got: {link_val!r}"
 
         # The relative path should resolve to the correct target
         resolved = os.path.realpath(pjoin(mnt_dir, link_val))
