@@ -816,16 +816,18 @@ def test_large_file(tmpdir, capfd):
         SEEK_SIZE = 1024 * 1024        # 1 MB aligned seeks
         NUM_SEEKS = 20
 
-        # Build a reproducible 128 KB chunk from a seeded RNG
-        rng = random.Random(0xdeadbeef)
-        chunk = bytes(rng.getrandbits(8) for _ in range(CHUNK_SIZE))
+        def make_chunk(index):
+            """Generate a unique 128 KB chunk seeded by index."""
+            r = random.Random(0xdeadbeef + index)
+            return bytes(r.getrandbits(8) for _ in range(CHUNK_SIZE))
 
         filename = pjoin(mnt_dir, name_generator())
 
-        # Write 512 chunks (64 MB) in a loop
+        # Write 512 unique chunks (64 MB) in a loop
         hasher_write = hashlib.sha256()
         with open(filename, "wb") as fh:
-            for _ in range(NUM_CHUNKS):
+            for i in range(NUM_CHUNKS):
+                chunk = make_chunk(i)
                 fh.write(chunk)
                 hasher_write.update(chunk)
         expected_hash = hasher_write.digest()
@@ -851,15 +853,17 @@ def test_large_file(tmpdir, capfd):
                 fh.seek(offset)
                 buf = fh.read(SEEK_SIZE)
                 assert len(buf) == SEEK_SIZE, f"Short read at offset {offset}"
-                # Reconstruct expected bytes for this 1 MB window
+                # Reconstruct expected bytes from position-dependent chunks
                 expected = bytearray()
-                lo = offset % CHUNK_SIZE
+                pos = offset
                 remaining = SEEK_SIZE
                 while remaining > 0:
+                    chunk_idx = pos // CHUNK_SIZE
+                    lo = pos % CHUNK_SIZE
                     take = min(CHUNK_SIZE - lo, remaining)
-                    expected += chunk[lo:lo + take]
+                    expected += make_chunk(chunk_idx)[lo:lo + take]
+                    pos += take
                     remaining -= take
-                    lo = 0
                 assert buf == bytes(expected), f"Content mismatch at offset {offset}"
 
         os.unlink(filename)
@@ -875,7 +879,7 @@ def test_random_file_ops(tmpdir, capfd):
     mount_process, mnt_dir, src_dir = _mount_sshfs(tmpdir)
     try:
         INITIAL_SIZE = 512 * 1024      # 512 KB
-        MAX_SIZE = INITIAL_SIZE + 1    # upper bound for truncate
+        MAX_SIZE = 2 * INITIAL_SIZE    # 1 MB upper bound
         MAX_RW_LEN = 8 * 1024          # 8 KB max per op
         ITERATIONS = 500
 
@@ -895,11 +899,17 @@ def test_random_file_ops(tmpdir, capfd):
             current_len = len(ground_truth)
 
             if op == "write":
-                if current_len == 0:
+                if current_len == 0 and MAX_SIZE == 0:
                     continue
-                offset = rng.randint(0, current_len - 1)
-                length = rng.randint(1, min(MAX_RW_LEN, current_len - offset))
+                offset = rng.randint(0, current_len)
+                max_len = min(MAX_RW_LEN, MAX_SIZE - offset)
+                if max_len <= 0:
+                    continue
+                length = rng.randint(1, max_len)
                 data = bytes(rng.getrandbits(8) for _ in range(length))
+                # Extend ground_truth with zeros if writing past EOF
+                if offset + length > current_len:
+                    ground_truth.extend(b"\x00" * (offset + length - current_len))
                 with open(filename, "r+b") as fh:
                     fh.seek(offset)
                     fh.write(data)
