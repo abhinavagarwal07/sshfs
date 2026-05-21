@@ -802,3 +802,41 @@ def test_direct_io(tmpdir, capfd):
         raise
     else:
         umount(mount_process, mnt_dir)
+
+
+def test_permission_errors(tmpdir, capfd):
+    capfd.register_output(r"^Warning: Permanently added 'localhost' .+", count=0)
+    if os.getuid() == 0:
+        pytest.skip("permission tests are meaningless as root")
+    mount_process, mnt_dir, src_dir = _mount_sshfs(tmpdir)
+    try:
+        # Test 1: unreadable file
+        secret = pjoin(src_dir, "secret")
+        with open(secret, "wb") as fh:
+            fh.write(b"secret data")
+        os.chmod(secret, 0o000)
+        try:
+            mnt_secret = pjoin(mnt_dir, "secret")
+            with pytest.raises(OSError) as exc_info:
+                open(mnt_secret, "rb").close()
+            assert exc_info.value.errno in (errno.EACCES, errno.EPERM)
+        finally:
+            os.chmod(secret, 0o644)
+            os.unlink(secret)
+
+        # Test 2: unwritable directory
+        locked_dir = pjoin(src_dir, "locked_dir")
+        os.mkdir(locked_dir, 0o500)
+        try:
+            mnt_locked = pjoin(mnt_dir, "locked_dir")
+            with pytest.raises(OSError) as exc_info:
+                open(pjoin(mnt_locked, "should_fail"), "wb").close()
+            assert exc_info.value.errno in (errno.EACCES, errno.EPERM)
+        finally:
+            os.chmod(locked_dir, 0o700)
+            os.rmdir(locked_dir)
+    except Exception:
+        cleanup(mount_process, mnt_dir)
+        raise
+    else:
+        umount(mount_process, mnt_dir)
