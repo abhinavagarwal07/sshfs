@@ -807,13 +807,14 @@ def test_direct_io(tmpdir, capfd):
 
 def test_sshfs_sync(tmpdir, capfd):
     capfd.register_output(r"^Warning: Permanently added 'localhost' .+", count=0)
+    # Smoke test: verify basic I/O still works with sync writes enabled
     mount_process, mnt_dir, src_dir = _mount_sshfs(tmpdir, ['sshfs_sync'])
     try:
         tst_open_write(src_dir, mnt_dir)
         tst_append(src_dir, mnt_dir)
         tst_truncate_path(mnt_dir)
         tst_fsync(src_dir, mnt_dir)
-    except:
+    except Exception:
         cleanup(mount_process, mnt_dir)
         raise
     else:
@@ -822,12 +823,13 @@ def test_sshfs_sync(tmpdir, capfd):
 
 def test_no_readahead(tmpdir, capfd):
     capfd.register_output(r"^Warning: Permanently added 'localhost' .+", count=0)
+    # Smoke test: verify reads still work with readahead disabled
     mount_process, mnt_dir, src_dir = _mount_sshfs(tmpdir, ['no_readahead'])
     try:
         tst_open_read(src_dir, mnt_dir)
         tst_seek(src_dir, mnt_dir)
         tst_truncate_path(mnt_dir)
-    except:
+    except Exception:
         cleanup(mount_process, mnt_dir)
         raise
     else:
@@ -842,8 +844,10 @@ def test_small_max_rw(tmpdir, capfd):
     try:
         tst_open_read(src_dir, mnt_dir)
         tst_open_write(src_dir, mnt_dir)
+        tst_append(src_dir, mnt_dir)
+        tst_seek(src_dir, mnt_dir)
         tst_truncate_path(mnt_dir)
-    except:
+    except Exception:
         cleanup(mount_process, mnt_dir)
         raise
     else:
@@ -857,7 +861,7 @@ def test_delay_connect(tmpdir, capfd):
         tst_create(mnt_dir)
         tst_open_read(src_dir, mnt_dir)
         tst_open_write(src_dir, mnt_dir)
-    except:
+    except Exception:
         cleanup(mount_process, mnt_dir)
         raise
     else:
