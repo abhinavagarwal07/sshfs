@@ -188,7 +188,7 @@ def _mount_sshfs(tmpdir, extra_opts=None):
     mount_process = subprocess.Popen(cmdline, env=new_env)
     try:
         wait_for_mount(mount_process, mnt_dir)
-    except:
+    except Exception:
         cleanup(mount_process, mnt_dir)
         raise
     return mount_process, mnt_dir, src_dir
