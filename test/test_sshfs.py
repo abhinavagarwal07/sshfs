@@ -25,6 +25,7 @@ from util import (
     safe_sleep,
     os_create,
     os_open,
+    _check_ssh_localhost,
     _mount_sshfs,
 )
 from os.path import join as pjoin
@@ -802,3 +803,60 @@ def test_direct_io(tmpdir, capfd):
         raise
     else:
         umount(mount_process, mnt_dir)
+
+
+def test_dual_mount(tmpdir, capfd):
+    capfd.register_output(r"^Warning: Permanently added 'localhost' .+", count=0)
+    _check_ssh_localhost()
+
+    src_dir = str(tmpdir.mkdir("shared_src"))
+    mnt1 = str(tmpdir.mkdir("mnt_a"))
+    mnt2 = str(tmpdir.mkdir("mnt_b"))
+
+    def _start_mount(mnt_dir):
+        cmdline = base_cmdline + [
+            pjoin(basename, "sshfs"),
+            "-f",
+            f"localhost:{src_dir}",
+            mnt_dir,
+            "-o", "entry_timeout=0",
+            "-o", "attr_timeout=0",
+            "-o", "dir_cache=no",
+        ]
+        new_env = dict(os.environ)
+        new_env["G_DEBUG"] = "fatal-warnings"
+        proc = subprocess.Popen(cmdline, env=new_env)
+        try:
+            wait_for_mount(proc, mnt_dir)
+        except Exception:
+            cleanup(proc, mnt_dir)
+            raise
+        return proc
+
+    proc1 = _start_mount(mnt1)
+    try:
+        proc2 = _start_mount(mnt2)
+        try:
+            # Create file via mnt1, verify visible in mnt2
+            with open(pjoin(mnt1, "shared_file"), "wb") as f:
+                f.write(b"written via mnt1")
+
+            assert os.path.exists(pjoin(mnt2, "shared_file"))
+            with open(pjoin(mnt2, "shared_file"), "rb") as f:
+                assert f.read() == b"written via mnt1"
+
+            # Write via mnt2, read via mnt1
+            with open(pjoin(mnt2, "shared_file"), "wb") as f:
+                f.write(b"overwritten via mnt2")
+            with open(pjoin(mnt1, "shared_file"), "rb") as f:
+                assert f.read() == b"overwritten via mnt2"
+        except Exception:
+            cleanup(proc2, mnt2)
+            raise
+        else:
+            umount(proc2, mnt2)
+    except Exception:
+        cleanup(proc1, mnt1)
+        raise
+    else:
+        umount(proc1, mnt1)
