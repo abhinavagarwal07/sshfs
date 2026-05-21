@@ -25,6 +25,7 @@ from util import (
     safe_sleep,
     os_create,
     os_open,
+    _mount_sshfs,
 )
 from os.path import join as pjoin
 
@@ -724,56 +725,6 @@ def tst_passthrough(src_dir, mnt_dir, cache_timeout):
     assert src_st.st_uid == mnt_st.st_uid
     assert src_st.st_gid == mnt_st.st_gid
     assert abs(src_st.st_mtime - mnt_st.st_mtime) <= 1
-
-
-def _check_ssh_localhost():
-    try:
-        res = subprocess.call(
-            ["ssh", "-o", "StrictHostKeyChecking=no",
-             "-o", "KbdInteractiveAuthentication=no",
-             "-o", "ChallengeResponseAuthentication=no",
-             "-o", "PasswordAuthentication=no",
-             "localhost", "--", "true"],
-            stdin=subprocess.DEVNULL, timeout=10,
-        )
-    except subprocess.TimeoutExpired:
-        res = 1
-    if res != 0:
-        pytest.fail("Unable to ssh into localhost without password prompt.")
-
-
-_mount_ctr = [0]
-
-
-def _mount_sshfs(tmpdir, extra_opts=None):
-    """Helper to mount sshfs with custom options. Returns (mount_process, mnt_dir, src_dir)."""
-    _check_ssh_localhost()
-    _mount_ctr[0] += 1
-    mnt_dir = str(tmpdir.mkdir(f"mnt{_mount_ctr[0]}"))
-    src_dir = str(tmpdir.mkdir(f"src{_mount_ctr[0]}"))
-
-    cmdline = base_cmdline + [
-        pjoin(basename, "sshfs"),
-        "-f",
-        f"localhost:{src_dir}",
-        mnt_dir,
-        "-o", "entry_timeout=0",
-        "-o", "attr_timeout=0",
-    ]
-    if extra_opts:
-        for opt in extra_opts:
-            cmdline += ["-o", opt]
-
-    new_env = dict(os.environ)
-    new_env["G_DEBUG"] = "fatal-warnings"
-
-    mount_process = subprocess.Popen(cmdline, env=new_env)
-    try:
-        wait_for_mount(mount_process, mnt_dir)
-    except:
-        cleanup(mount_process, mnt_dir)
-        raise
-    return mount_process, mnt_dir, src_dir
 
 
 def test_disable_hardlink(tmpdir, capfd):
