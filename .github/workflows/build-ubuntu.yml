@@ -45,6 +45,15 @@ jobs:
           ssh-keygen -b 2048 -t rsa  -f ~/.ssh/id_rsa -q -N ""
           cat ~/.ssh/id_rsa.pub > ~/.ssh/authorized_keys
 
+      - name: Build fsstress from xfstests
+        run: |
+          git clone --depth 1 https://github.com/kdave/xfstests-dev.git /tmp/xfstests
+          cd /tmp/xfstests
+          gcc -O2 -o ltp/fsstress ltp/fsstress.c -lpthread 2>/dev/null || \
+            make -j$(nproc) ltp/fsstress 2>/dev/null || \
+            echo "Warning: could not build fsstress"
+          echo "/tmp/xfstests/ltp" >> $GITHUB_PATH
+
       - name: run tests
         run: |
           cd build
