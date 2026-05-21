@@ -802,3 +802,147 @@ def test_direct_io(tmpdir, capfd):
         raise
     else:
         umount(mount_process, mnt_dir)
+
+
+def test_special_filenames(tmpdir, capfd):
+    capfd.register_output(r"^Warning: Permanently added 'localhost' .+", count=0)
+    mount_process, mnt_dir, src_dir = _mount_sshfs(tmpdir)
+    try:
+        special_names = [
+            "file with spaces",
+            "file'single_quote",
+            'file"double_quote',
+            "file\\backslash",
+            "file#hash",
+            "file%percent",
+            "-leading-dash",
+        ]
+        for name in special_names:
+            fullname = pjoin(mnt_dir, name)
+            content = f"content for {name}".encode()
+
+            with open(fullname, "wb") as fh:
+                fh.write(content)
+
+            assert name in os.listdir(mnt_dir), f"{name!r} not found in listdir"
+
+            with open(fullname, "rb") as fh:
+                assert fh.read() == content, f"read-back mismatch for {name!r}"
+
+            fstat = os.stat(fullname)
+            assert fstat.st_size == len(content), f"size mismatch for {name!r}"
+
+            os.unlink(fullname)
+            assert name not in os.listdir(mnt_dir), \
+                f"{name!r} still in listdir after unlink"
+
+        # Newline in filename: skip listdir assertions (newlines complicate string matching in test output)
+        nl_name = "file\nwith_newline"
+        nl_full = pjoin(mnt_dir, nl_name)
+        nl_content = b"newline filename content"
+
+        with open(nl_full, "wb") as fh:
+            fh.write(nl_content)
+
+        with open(nl_full, "rb") as fh:
+            assert fh.read() == nl_content, "read-back mismatch for newline name"
+
+        fstat = os.stat(nl_full)
+        assert fstat.st_size == len(nl_content), "size mismatch for newline name"
+
+        os.unlink(nl_full)
+        assert not os.path.exists(nl_full), "newline file still exists after unlink"
+    except Exception:
+        cleanup(mount_process, mnt_dir)
+        raise
+    else:
+        umount(mount_process, mnt_dir)
+
+
+def test_unicode_filenames(tmpdir, capfd):
+    capfd.register_output(r"^Warning: Permanently added 'localhost' .+", count=0)
+    mount_process, mnt_dir, src_dir = _mount_sshfs(tmpdir)
+    try:
+        # Each name is created, verified, and removed independently.
+        # This tests that sshfs handles various Unicode byte sequences, not normalization behavior.
+        unicode_names = [
+            "café",            # NFC precomposed e-acute
+            "café",           # NFD decomposed e-acute
+            "世界",         # CJK: 世界
+            "\U0001f4c1folder",     # emoji (4-byte UTF-8) + ASCII
+        ]
+        for name in unicode_names:
+            fullname = pjoin(mnt_dir, name)
+            content = f"unicode content for {name}".encode("utf-8")
+
+            with open(fullname, "wb") as fh:
+                fh.write(content)
+
+            assert name in os.listdir(mnt_dir), \
+                f"{repr(name)} not found in listdir"
+
+            with open(fullname, "rb") as fh:
+                assert fh.read() == content, \
+                    f"read-back mismatch for {repr(name)}"
+
+            os.unlink(fullname)
+            assert name not in os.listdir(mnt_dir), \
+                f"{repr(name)} still in listdir after unlink"
+    except Exception:
+        cleanup(mount_process, mnt_dir)
+        raise
+    else:
+        umount(mount_process, mnt_dir)
+
+
+def test_sparse_file(tmpdir, capfd):
+    capfd.register_output(r"^Warning: Permanently added 'localhost' .+", count=0)
+    mount_process, mnt_dir, src_dir = _mount_sshfs(tmpdir)
+    try:
+        name = name_generator()
+        fullname = pjoin(mnt_dir, name)
+
+        block = 4096
+        one_mb = 1024 * 1024
+
+        # Write 4 KB at offset 0, then 4 KB at offset 1 MB (leaving a ~1 MB hole)
+        fd = os.open(fullname, os.O_CREAT | os.O_RDWR | os.O_TRUNC)
+        try:
+            os.write(fd, b"A" * block)
+            os.lseek(fd, one_mb, os.SEEK_SET)
+            os.write(fd, b"B" * block)
+        finally:
+            os.close(fd)
+
+        expected_size = one_mb + block
+        fstat = os.stat(fullname)
+        assert fstat.st_size == expected_size, \
+            f"expected st_size={expected_size}, got {fstat.st_size}"
+
+        # Read back and verify all three regions
+        with open(fullname, "rb") as fh:
+            first = fh.read(block)
+            assert first == b"A" * block, "first block data mismatch"
+
+            hole = fh.read(one_mb - block)
+            assert hole == b"\0" * (one_mb - block), "hole region is not all zeros"
+
+            second = fh.read(block)
+            assert second == b"B" * block, "second block data mismatch"
+
+        # Truncate-extend to 2 MB and verify the new region reads as zeros
+        os.truncate(fullname, 2 * one_mb)
+        assert os.stat(fullname).st_size == 2 * one_mb
+
+        with open(fullname, "rb") as fh:
+            fh.seek(one_mb + block)
+            tail = fh.read(one_mb - block)
+            assert tail == b"\0" * (one_mb - block), \
+                "region past old EOF is not all zeros after truncate-extend"
+
+        os.unlink(fullname)
+    except Exception:
+        cleanup(mount_process, mnt_dir)
+        raise
+    else:
+        umount(mount_process, mnt_dir)
