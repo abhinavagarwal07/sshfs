@@ -26,6 +26,7 @@ from util import (
     os_create,
     os_open,
     _mount_sshfs,
+    _check_ssh_localhost,
 )
 from os.path import join as pjoin
 
@@ -802,3 +803,105 @@ def test_direct_io(tmpdir, capfd):
         raise
     else:
         umount(mount_process, mnt_dir)
+
+
+def test_disk_full_enospc(tmpdir, capfd):
+    capfd.register_output(r"^Warning: Permanently added 'localhost' .+", count=0)
+
+    # Need sudo for tmpfs mount
+    if subprocess.call(["sudo", "-n", "true"]) != 0:
+        pytest.skip("sudo required for tmpfs mount")
+
+    tmpfs_dir = str(tmpdir.mkdir("tmpfs_src"))
+    mount_process = None
+    mnt_dir = None
+    tmpfs_mounted = False
+
+    try:
+        # Create a tiny 1MB tmpfs
+        subprocess.check_call(
+            ["sudo", "mount", "-t", "tmpfs", "-o", "size=1M", "tmpfs", tmpfs_dir],
+            timeout=10,
+        )
+        tmpfs_mounted = True
+        # Make it writable by current user
+        subprocess.check_call(["sudo", "chmod", "777", tmpfs_dir], timeout=10)
+
+        _check_ssh_localhost()
+
+        # Build sshfs mount cmdline manually (can't use _mount_sshfs because
+        # we need to mount against the tmpfs dir, not a tmpdir subdir)
+        mnt_dir = str(tmpdir.mkdir("mnt_enospc"))
+        cmdline = base_cmdline + [
+            pjoin(basename, "sshfs"),
+            "-f",
+            f"localhost:{tmpfs_dir}",
+            mnt_dir,
+            "-o", "entry_timeout=0",
+            "-o", "attr_timeout=0",
+            "-o", "dir_cache=no",
+        ]
+        new_env = dict(os.environ)
+        new_env["G_DEBUG"] = "fatal-warnings"
+        mount_process = subprocess.Popen(cmdline, env=new_env)
+
+        try:
+            wait_for_mount(mount_process, mnt_dir)
+        except Exception:
+            cleanup(mount_process, mnt_dir)
+            mount_process = None
+            raise
+
+        # Write a sentinel file
+        sentinel = pjoin(mnt_dir, "sentinel")
+        with open(sentinel, "wb") as fh:
+            fh.write(b"sentinel data before disk full\n")
+            fh.flush()
+            os.fsync(fh.fileno())
+
+        # Fill filesystem in 4KB chunks until error
+        got_error = False
+        for i in range(500):
+            try:
+                fpath = pjoin(mnt_dir, f"fill_{i}.bin")
+                with open(fpath, "wb") as fh:
+                    fh.write(b"\x00" * 4096)
+                    fh.flush()
+                    os.fsync(fh.fileno())
+            except OSError as e:
+                assert e.errno in (errno.ENOSPC, errno.EIO), \
+                    f"unexpected errno: {e.errno}"
+                got_error = True
+                break
+
+        if not got_error and mount_process.poll() is not None:
+            pytest.fail("sshfs process died during ENOSPC fill")
+        assert got_error, "expected ENOSPC/EIO but filesystem never filled up"
+
+        # Verify sshfs is still alive after ENOSPC
+        if mount_process.poll() is not None:
+            pytest.fail("sshfs process died during ENOSPC fill")
+
+        # Verify sentinel file is intact
+        with open(sentinel, "rb") as fh:
+            assert fh.read() == b"sentinel data before disk full\n"
+
+    except Exception:
+        # Unmount sshfs BEFORE tmpfs (sshfs uses tmpfs as backing store)
+        if mount_process is not None:
+            cleanup(mount_process, mnt_dir)
+            mount_process = None
+        raise
+    else:
+        if mount_process is not None:
+            umount(mount_process, mnt_dir)
+            mount_process = None
+    finally:
+        # Always try to unmount tmpfs (sshfs must be gone by now)
+        if tmpfs_mounted:
+            subprocess.call(
+                ["sudo", "umount", "-n", tmpfs_dir],
+                timeout=10,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
