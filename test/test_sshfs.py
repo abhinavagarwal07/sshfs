@@ -813,8 +813,8 @@ def test_large_file(tmpdir, capfd):
     try:
         CHUNK_SIZE = 128 * 1024        # 128 KB
         NUM_CHUNKS = 512               # 64 MB total
-        SEEK_SIZE = 1024 * 1024        # 1 MB aligned seeks
-        NUM_SEEKS = 20
+        SEEK_SIZE = 131073             # 128 KB + 1 byte — forces chunk-boundary crossings
+        NUM_SEEKS = 20                 # unaligned seeks exercise partial-chunk reconstruction
 
         def make_chunk(index):
             """Generate a unique 128 KB chunk seeded by index."""
@@ -842,7 +842,7 @@ def test_large_file(tmpdir, capfd):
                 hasher_read.update(buf)
         assert hasher_read.digest() == expected_hash, "SHA-256 mismatch on sequential read"
 
-        # Random seek verification: 20 random 1 MB-aligned offsets
+        # Random seek verification: 20 random unaligned offsets
         total_size = CHUNK_SIZE * NUM_CHUNKS
         seek_rng = random.Random(42)
         max_offset = (total_size // SEEK_SIZE) - 1
@@ -899,8 +899,6 @@ def test_random_file_ops(tmpdir, capfd):
             current_len = len(ground_truth)
 
             if op == "write":
-                if current_len == 0 and MAX_SIZE == 0:
-                    continue
                 offset = rng.randint(0, current_len)
                 max_len = min(MAX_RW_LEN, MAX_SIZE - offset)
                 if max_len <= 0:
@@ -931,6 +929,7 @@ def test_random_file_ops(tmpdir, capfd):
                 with open(filename, "rb") as fh:
                     fh.seek(offset)
                     buf = fh.read(length)
+                assert len(buf) == length, f"short read: got {len(buf)}, expected {length} at offset {offset}"
                 expected = bytes(ground_truth[offset:offset + length])
                 assert buf == expected, (
                     f"read_verify mismatch at offset={offset} length={length}"
