@@ -802,3 +802,53 @@ def test_direct_io(tmpdir, capfd):
         raise
     else:
         umount(mount_process, mnt_dir)
+
+
+def test_fsstress(tmpdir, capfd):
+    capfd.register_output(r"^Warning: Permanently added 'localhost' .+", count=0)
+
+    # Find fsstress binary (part of xfstests)
+    fsstress_bin = shutil.which("fsstress")
+    if fsstress_bin is None:
+        candidate = "/tmp/xfstests/ltp/fsstress"
+        if os.path.isfile(candidate):
+            fsstress_bin = candidate
+    if fsstress_bin is None:
+        pytest.skip(
+            "fsstress not found; build from xfstests: "
+            "git clone --depth=1 https://github.com/kdave/xfstests /tmp/xfstests && "
+            "cd /tmp/xfstests && make ltp"
+        )
+
+    mount_process, mnt_dir, src_dir = _mount_sshfs(tmpdir)
+    try:
+        stress_dir = pjoin(mnt_dir, "stress")
+        os.makedirs(stress_dir, exist_ok=True)
+
+        result = subprocess.run(
+            [fsstress_bin, "-d", stress_dir, "-n", "500", "-p", "4"],
+            capture_output=True,
+            timeout=300,
+        )
+        assert result.returncode == 0, (
+            f"fsstress failed (exit {result.returncode}):\n"
+            f"stdout (last 2000): {result.stdout[-2000:]}\n"
+            f"stderr (last 500): {result.stderr[-500:]}"
+        )
+
+        # Post-stress consistency check: verify the mount is still functional
+        canary = pjoin(mnt_dir, "post_stress_canary")
+        with open(canary, "wb") as fh:
+            fh.write(b"still alive")
+        with open(canary, "rb") as fh:
+            assert fh.read() == b"still alive"
+        os.unlink(canary)
+
+        # Verify stress directory is still listable
+        os.listdir(stress_dir)
+
+    except Exception:
+        cleanup(mount_process, mnt_dir)
+        raise
+    else:
+        umount(mount_process, mnt_dir)
