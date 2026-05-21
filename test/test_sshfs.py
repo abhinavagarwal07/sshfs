@@ -836,7 +836,7 @@ def test_rsync_archive(tmpdir, capfd):
             timeout=120,
         )
         assert ret == 0, "rsync'd tree differs from source"
-    except:
+    except Exception:
         cleanup(mount_process, mnt_dir)
         raise
     else:
@@ -877,7 +877,7 @@ def test_tar_roundtrip(tmpdir, capfd):
             timeout=120,
         )
         assert ret == 0, "tar round-trip produced different tree"
-    except:
+    except Exception:
         cleanup(mount_process, mnt_dir)
         raise
     else:
@@ -956,7 +956,7 @@ def test_find_grep(tmpdir, capfd):
         assert len(needle_lines) == expected_needles, (
             f"grep found {len(needle_lines)} needle lines, expected {expected_needles}"
         )
-    except:
+    except Exception:
         cleanup(mount_process, mnt_dir)
         raise
     else:
