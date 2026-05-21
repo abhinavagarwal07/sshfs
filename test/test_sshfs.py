@@ -837,8 +837,7 @@ def test_special_filenames(tmpdir, capfd):
             assert name not in os.listdir(mnt_dir), \
                 f"{name!r} still in listdir after unlink"
 
-        # Newline in filename: skip listdir checks since os.listdir()
-        # may not reliably match names with embedded newlines.
+        # Newline in filename: skip listdir assertions (newlines complicate string matching in test output)
         nl_name = "file\nwith_newline"
         nl_full = pjoin(mnt_dir, nl_name)
         nl_content = b"newline filename content"
@@ -854,7 +853,7 @@ def test_special_filenames(tmpdir, capfd):
 
         os.unlink(nl_full)
         assert not os.path.exists(nl_full), "newline file still exists after unlink"
-    except:
+    except Exception:
         cleanup(mount_process, mnt_dir)
         raise
     else:
@@ -865,6 +864,8 @@ def test_unicode_filenames(tmpdir, capfd):
     capfd.register_output(r"^Warning: Permanently added 'localhost' .+", count=0)
     mount_process, mnt_dir, src_dir = _mount_sshfs(tmpdir)
     try:
+        # Each name is created, verified, and removed independently.
+        # This tests that sshfs handles various Unicode byte sequences, not normalization behavior.
         unicode_names = [
             "café",            # NFC precomposed e-acute
             "café",           # NFD decomposed e-acute
@@ -888,7 +889,7 @@ def test_unicode_filenames(tmpdir, capfd):
             os.unlink(fullname)
             assert name not in os.listdir(mnt_dir), \
                 f"{repr(name)} still in listdir after unlink"
-    except:
+    except Exception:
         cleanup(mount_process, mnt_dir)
         raise
     else:
@@ -906,7 +907,7 @@ def test_sparse_file(tmpdir, capfd):
         one_mb = 1024 * 1024
 
         # Write 4 KB at offset 0, then 4 KB at offset 1 MB (leaving a ~1 MB hole)
-        fd = os.open(fullname, os.O_CREAT | os.O_RDWR)
+        fd = os.open(fullname, os.O_CREAT | os.O_RDWR | os.O_TRUNC)
         try:
             os.write(fd, b"A" * block)
             os.lseek(fd, one_mb, os.SEEK_SET)
@@ -941,7 +942,7 @@ def test_sparse_file(tmpdir, capfd):
                 "region past old EOF is not all zeros after truncate-extend"
 
         os.unlink(fullname)
-    except:
+    except Exception:
         cleanup(mount_process, mnt_dir)
         raise
     else:
