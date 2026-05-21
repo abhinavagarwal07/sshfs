@@ -836,6 +836,24 @@ def test_special_filenames(tmpdir, capfd):
             os.unlink(fullname)
             assert name not in os.listdir(mnt_dir), \
                 f"{name!r} still in listdir after unlink"
+
+        # Newline in filename: skip listdir checks since os.listdir()
+        # may not reliably match names with embedded newlines.
+        nl_name = "file\nwith_newline"
+        nl_full = pjoin(mnt_dir, nl_name)
+        nl_content = b"newline filename content"
+
+        with open(nl_full, "wb") as fh:
+            fh.write(nl_content)
+
+        with open(nl_full, "rb") as fh:
+            assert fh.read() == nl_content, "read-back mismatch for newline name"
+
+        fstat = os.stat(nl_full)
+        assert fstat.st_size == len(nl_content), "size mismatch for newline name"
+
+        os.unlink(nl_full)
+        assert not os.path.exists(nl_full), "newline file still exists after unlink"
     except:
         cleanup(mount_process, mnt_dir)
         raise
@@ -849,6 +867,7 @@ def test_unicode_filenames(tmpdir, capfd):
     try:
         unicode_names = [
             "café",            # NFC precomposed e-acute
+            "café",           # NFD decomposed e-acute
             "世界",         # CJK: 世界
             "\U0001f4c1folder",     # emoji (4-byte UTF-8) + ASCII
         ]
