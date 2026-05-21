@@ -810,32 +810,30 @@ def test_rsync_archive(tmpdir, capfd):
     mount_process, mnt_dir, src_dir = _mount_sshfs(tmpdir)
     try:
         # Build a small source tree to sync (a few files across subdirs)
-        fixture_dir = pjoin(os.path.dirname(__file__), "fixtures", "hello_c")
-        if os.path.isdir(fixture_dir):
-            source = fixture_dir
-        else:
-            source = str(tmpdir.mkdir("rsync_source"))
-            os.makedirs(pjoin(source, "sub"), exist_ok=True)
-            files = [
-                ("file_a.txt", b"alpha\n"),
-                ("file_b.txt", b"beta\n"),
-                (pjoin("sub", "file_c.txt"), b"gamma\n"),
-                (pjoin("sub", "file_d.txt"), b"delta\n"),
-                ("file_e.txt", b"epsilon\n"),
-            ]
-            for rel, data in files:
-                with open(pjoin(source, rel), "wb") as fh:
-                    fh.write(data)
+        source = str(tmpdir.mkdir("rsync_source"))
+        os.makedirs(pjoin(source, "sub"), exist_ok=True)
+        files = [
+            ("file_a.txt", b"alpha\n"),
+            ("file_b.txt", b"beta\n"),
+            (pjoin("sub", "file_c.txt"), b"gamma\n"),
+            (pjoin("sub", "file_d.txt"), b"delta\n"),
+            ("file_e.txt", b"epsilon\n"),
+        ]
+        for rel, data in files:
+            with open(pjoin(source, rel), "wb") as fh:
+                fh.write(data)
 
         dest = pjoin(mnt_dir, "rsync_dest")
         os.makedirs(dest, exist_ok=True)
 
         subprocess.check_call(
-            ["rsync", "-a", "--checksum", source + "/", dest + "/"]
+            ["rsync", "-a", "--checksum", source + "/", dest + "/"],
+            timeout=120,
         )
 
         ret = subprocess.call(
-            ["diff", "-r", "--no-dereference", source + "/", dest + "/"]
+            ["diff", "-r", "--no-dereference", source + "/", dest + "/"],
+            timeout=120,
         )
         assert ret == 0, "rsync'd tree differs from source"
     except:
@@ -849,9 +847,9 @@ def test_tar_roundtrip(tmpdir, capfd):
     capfd.register_output(r"^Warning: Permanently added 'localhost' .+", count=0)
     mount_process, mnt_dir, src_dir = _mount_sshfs(tmpdir)
     try:
-        # Create source files in the server-side backing store
+        # Create source tree through the mount so the write path goes via sshfs
         tree_name = "tar_source"
-        tree_root = pjoin(src_dir, tree_name)
+        tree_root = pjoin(mnt_dir, tree_name)
         os.makedirs(pjoin(tree_root, "subdir"), exist_ok=True)
         files = [
             ("readme.txt", b"tar round-trip test\n"),
@@ -865,19 +863,52 @@ def test_tar_roundtrip(tmpdir, capfd):
         # Create archive via the mount
         archive = pjoin(mnt_dir, "archive.tar.gz")
         subprocess.check_call(
-            ["tar", "czf", archive, "-C", src_dir, tree_name]
+            ["tar", "czf", archive, "-C", mnt_dir, tree_name],
+            timeout=120,
         )
 
         # Extract via the mount
         extract_dir = pjoin(mnt_dir, "extracted")
         os.makedirs(extract_dir, exist_ok=True)
-        subprocess.check_call(["tar", "xzf", archive, "-C", extract_dir])
+        subprocess.check_call(["tar", "xzf", archive, "-C", extract_dir], timeout=120)
 
         ret = subprocess.call(
-            ["diff", "-r", tree_root, pjoin(extract_dir, tree_name)]
+            ["diff", "-r", tree_root, pjoin(extract_dir, tree_name)],
+            timeout=120,
         )
         assert ret == 0, "tar round-trip produced different tree"
     except:
+        cleanup(mount_process, mnt_dir)
+        raise
+    else:
+        umount(mount_process, mnt_dir)
+
+
+def test_cp_archive(tmpdir, capfd):
+    capfd.register_output(r"^Warning: Permanently added 'localhost' .+", count=0)
+    mount_process, mnt_dir, src_dir = _mount_sshfs(tmpdir)
+    try:
+        # Create source tree through the mount
+        tree_root = pjoin(mnt_dir, "cp_source")
+        os.makedirs(pjoin(tree_root, "subdir"), exist_ok=True)
+        files = [
+            ("file_a.txt", b"alpha\n"),
+            ("file_b.txt", b"beta\n"),
+            (pjoin("subdir", "file_c.txt"), b"gamma\n"),
+        ]
+        for rel, data in files:
+            with open(pjoin(tree_root, rel), "wb") as fh:
+                fh.write(data)
+
+        dest = pjoin(mnt_dir, "cp_dest")
+        subprocess.check_call(["cp", "-a", tree_root, dest], timeout=120)
+
+        ret = subprocess.call(
+            ["diff", "-r", "--no-dereference", tree_root, dest],
+            timeout=120,
+        )
+        assert ret == 0, "cp -a tree differs from source"
+    except Exception:
         cleanup(mount_process, mnt_dir)
         raise
     else:
@@ -908,7 +939,8 @@ def test_find_grep(tmpdir, capfd):
 
         # find via mount — count .txt files
         find_out = subprocess.check_output(
-            ["find", mnt_dir, "-name", "*.txt", "-type", "f"]
+            ["find", mnt_dir, "-name", "*.txt", "-type", "f"],
+            timeout=120,
         )
         found_files = sorted(line for line in find_out.decode().splitlines() if line)
         assert len(found_files) == num_files, (
@@ -917,7 +949,7 @@ def test_find_grep(tmpdir, capfd):
 
         # grep via mount — count needle matches
         grep_out = subprocess.check_output(
-            ["grep", "-r", "needle", mnt_dir], stderr=subprocess.DEVNULL
+            ["grep", "-r", "needle", mnt_dir], stderr=subprocess.DEVNULL, timeout=120
         )
         needle_lines = [l for l in grep_out.decode().splitlines() if l]
         expected_needles = num_files // needle_interval
