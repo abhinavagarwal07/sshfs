@@ -802,3 +802,135 @@ def test_direct_io(tmpdir, capfd):
         raise
     else:
         umount(mount_process, mnt_dir)
+
+
+def test_truncate_workaround(tmpdir, capfd):
+    capfd.register_output(r"^Warning: Permanently added 'localhost' .+", count=0)
+    # Smoke test: verify truncate still works with the workaround enabled
+    mount_process, mnt_dir, src_dir = _mount_sshfs(tmpdir, ["workaround=truncate"])
+    try:
+        tst_truncate_path(mnt_dir)
+        tst_truncate_fd(mnt_dir)
+    except Exception:
+        cleanup(mount_process, mnt_dir)
+        raise
+    else:
+        umount(mount_process, mnt_dir)
+
+
+def test_fstat_workaround(tmpdir, capfd):
+    capfd.register_output(r"^Warning: Permanently added 'localhost' .+", count=0)
+    # Smoke test: verify fsync still works with the fstat workaround enabled
+    mount_process, mnt_dir, src_dir = _mount_sshfs(tmpdir, ["workaround=fstat"])
+    try:
+        tst_truncate_fd(mnt_dir)
+        tst_fsync(src_dir, mnt_dir)
+    except Exception:
+        cleanup(mount_process, mnt_dir)
+        raise
+    else:
+        umount(mount_process, mnt_dir)
+
+
+def test_createmode_workaround(tmpdir, capfd):
+    capfd.register_output(r"^Warning: Permanently added 'localhost' .+", count=0)
+    # Smoke test: verify chmod still works with the createmode workaround enabled
+    mount_process, mnt_dir, src_dir = _mount_sshfs(tmpdir, ["workaround=createmode"])
+    try:
+        filename = pjoin(mnt_dir, name_generator())
+        fd = os.open(filename, os.O_CREAT | os.O_RDWR)
+        os.close(fd)
+
+        # With createmode workaround the initial mode after create may be 0;
+        # verify that an explicit chmod works correctly after the file exists.
+        os.chmod(filename, 0o644)
+        fstat = os.stat(filename)
+        assert stat.S_IMODE(fstat.st_mode) == 0o644
+
+        os.chmod(filename, 0o755)
+        fstat = os.stat(filename)
+        assert stat.S_IMODE(fstat.st_mode) == 0o755
+
+        os.unlink(filename)
+    except Exception:
+        cleanup(mount_process, mnt_dir)
+        raise
+    else:
+        umount(mount_process, mnt_dir)
+
+
+def test_renamexdev_workaround(tmpdir, capfd):
+    capfd.register_output(r"^Warning: Permanently added 'localhost' .+", count=0)
+    # Smoke test: verify rename still works with the renamexdev workaround enabled
+    mount_process, mnt_dir, src_dir = _mount_sshfs(tmpdir, ["workaround=renamexdev"])
+    try:
+        tst_rename(mnt_dir)
+        tst_rename_over(mnt_dir)
+    except Exception:
+        cleanup(mount_process, mnt_dir)
+        raise
+    else:
+        umount(mount_process, mnt_dir)
+
+
+def test_transform_symlinks(tmpdir, capfd):
+    capfd.register_output(r"^Warning: Permanently added 'localhost' .+", count=0)
+    mount_process, mnt_dir, src_dir = _mount_sshfs(tmpdir, ["transform_symlinks"])
+    try:
+        # Create subdirectory and target file on the server side
+        subdir = pjoin(src_dir, "subdir")
+        os.mkdir(subdir)
+        target = pjoin(subdir, "target")
+        with open(target, "wb") as fh:
+            fh.write(b"transform symlink target")
+
+        # Create an absolute symlink on the server side pointing into the tree
+        abs_link_src = pjoin(src_dir, "abs_link")
+        os.symlink(src_dir + "/subdir/target", abs_link_src)
+
+        # Read the symlink through the mount — transform_symlinks should
+        # convert the absolute path to a relative one
+        link_val = os.readlink(pjoin(mnt_dir, "abs_link"))
+        assert not os.path.isabs(link_val), (
+            f"expected a relative path but got: {link_val!r}"
+        )
+        assert link_val == "subdir/target", f"expected 'subdir/target' but got: {link_val!r}"
+
+        # The relative path should resolve to the correct target
+        resolved = os.path.realpath(pjoin(mnt_dir, link_val))
+        assert os.path.exists(resolved)
+
+        with open(pjoin(mnt_dir, "abs_link"), "rb") as fh:
+            assert fh.read() == b"transform symlink target"
+
+        os.unlink(abs_link_src)
+        os.unlink(target)
+        os.rmdir(subdir)
+    except Exception:
+        cleanup(mount_process, mnt_dir)
+        raise
+    else:
+        umount(mount_process, mnt_dir)
+
+
+def test_idmap_user(tmpdir, capfd):
+    capfd.register_output(r"^Warning: Permanently added 'localhost' .+", count=0)
+    mount_process, mnt_dir, src_dir = _mount_sshfs(tmpdir, ["idmap=user"])
+    try:
+        name = name_generator()
+        src_name = pjoin(src_dir, name)
+        mnt_name = pjoin(mnt_dir, name)
+
+        with open(src_name, "wb") as fh:
+            fh.write(b"idmap user test")
+
+        fstat = os.stat(mnt_name)
+        assert fstat.st_uid == os.getuid()
+        assert fstat.st_gid == os.getgid()
+
+        os.unlink(src_name)
+    except Exception:
+        cleanup(mount_process, mnt_dir)
+        raise
+    else:
+        umount(mount_process, mnt_dir)
