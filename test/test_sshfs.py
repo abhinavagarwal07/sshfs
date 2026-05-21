@@ -862,6 +862,7 @@ def test_renamexdev_workaround(tmpdir, capfd):
     mount_process, mnt_dir, src_dir = _mount_sshfs(tmpdir, ["workaround=renamexdev"])
     try:
         tst_rename(mnt_dir)
+        tst_rename_over(mnt_dir)
     except Exception:
         cleanup(mount_process, mnt_dir)
         raise
@@ -894,6 +895,9 @@ def test_transform_symlinks(tmpdir, capfd):
         # The relative path should resolve to the correct target
         resolved = os.path.realpath(pjoin(mnt_dir, link_val))
         assert os.path.exists(resolved)
+
+        with open(pjoin(mnt_dir, "abs_link"), "rb") as fh:
+            assert fh.read() == b"transform symlink target"
 
         os.unlink(abs_link_src)
         os.unlink(target)
