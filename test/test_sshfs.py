@@ -805,21 +805,22 @@ def test_direct_io(tmpdir, capfd):
         umount(mount_process, mnt_dir)
 
 
+def _parallel_writer_worker(args):
+    idx, mnt = args
+    path = os.path.join(mnt, f"parallel_{idx}.bin")
+    data = bytes([idx & 0xff]) * (64 * 1024)
+    with open(path, "wb") as fh:
+        fh.write(data)
+    with open(path, "rb") as fh:
+        assert fh.read() == data
+
+
 def test_parallel_writers(tmpdir, capfd):
     capfd.register_output(r"^Warning: Permanently added 'localhost' .+", count=0)
     mount_process, mnt_dir, src_dir = _mount_sshfs(tmpdir, ["max_conns=4"])
     try:
-        def worker(args):
-            idx, mnt = args
-            path = os.path.join(mnt, f"parallel_{idx}.bin")
-            data = bytes([idx & 0xff]) * (64 * 1024)
-            with open(path, "wb") as fh:
-                fh.write(data)
-            with open(path, "rb") as fh:
-                assert fh.read() == data
-
         with multiprocessing.Pool(8) as pool:
-            pool.map(worker, [(i, mnt_dir) for i in range(8)])
+            pool.map(_parallel_writer_worker, [(i, mnt_dir) for i in range(8)])
 
         # Verify all files exist and have correct content
         for i in range(8):
