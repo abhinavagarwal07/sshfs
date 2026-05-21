@@ -867,7 +867,7 @@ def test_large_file(tmpdir, capfd):
                 assert buf == bytes(expected), f"Content mismatch at offset {offset}"
 
         os.unlink(filename)
-    except:
+    except Exception:
         cleanup(mount_process, mnt_dir)
         raise
     else:
@@ -936,7 +936,7 @@ def test_random_file_ops(tmpdir, capfd):
                 )
 
         os.unlink(filename)
-    except:
+    except Exception:
         cleanup(mount_process, mnt_dir)
         raise
     else:
