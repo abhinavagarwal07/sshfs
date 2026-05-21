@@ -25,7 +25,6 @@ from util import (
     safe_sleep,
     os_create,
     os_open,
-    _check_ssh_localhost,
     _mount_sshfs,
 )
 from os.path import join as pjoin

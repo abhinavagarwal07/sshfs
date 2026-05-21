@@ -4,6 +4,7 @@ import pytest
 import os
 import stat
 import time
+import functools
 from os.path import join as pjoin
 from contextlib import contextmanager
 
@@ -131,7 +132,17 @@ else:
     base_cmdline = []
 
 
+_ssh_checked = False
+_ssh_available = False
+
+
 def _check_ssh_localhost():
+    global _ssh_checked, _ssh_available
+    if _ssh_checked:
+        if not _ssh_available:
+            pytest.skip("Unable to ssh into localhost without password prompt.")
+        return
+    _ssh_checked = True
     try:
         res = subprocess.call(
             ["ssh", "-o", "StrictHostKeyChecking=no",
@@ -144,7 +155,9 @@ def _check_ssh_localhost():
     except subprocess.TimeoutExpired:
         res = 1
     if res != 0:
-        pytest.fail("Unable to ssh into localhost without password prompt.")
+        _ssh_available = False
+        pytest.skip("Unable to ssh into localhost without password prompt.")
+    _ssh_available = True
 
 
 _mount_ctr = [0]
@@ -165,7 +178,7 @@ def _mount_sshfs(tmpdir, extra_opts=None):
         "-o", "entry_timeout=0",
         "-o", "attr_timeout=0",
     ]
-    if extra_opts:
+    if extra_opts is not None:
         for opt in extra_opts:
             cmdline += ["-o", opt]
 
