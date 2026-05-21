@@ -5,8 +5,11 @@ import os
 import stat
 import time
 import functools
+import shutil
 from os.path import join as pjoin
 from contextlib import contextmanager
+
+FUSERMOUNT_BIN = "fusermount3" if shutil.which("fusermount3") else "fusermount"
 
 basename = pjoin(os.path.dirname(__file__), "..")
 
@@ -38,7 +41,7 @@ def wait_for_mount(mount_process, mnt_dir, test_fn=os.path.ismount):
 
 def cleanup(mount_process, mnt_dir):
     subprocess.call(
-        ["fusermount", "-z", "-u", mnt_dir],
+        [FUSERMOUNT_BIN, "-z", "-u", mnt_dir],
         stdout=subprocess.DEVNULL,
         stderr=subprocess.STDOUT,
     )
@@ -50,7 +53,7 @@ def cleanup(mount_process, mnt_dir):
 
 
 def umount(mount_process, mnt_dir):
-    subprocess.check_call(["fusermount3", "-z", "-u", mnt_dir])
+    subprocess.check_call([FUSERMOUNT_BIN, "-z", "-u", mnt_dir])
     assert not os.path.ismount(mnt_dir)
 
     # Give mount process a little while to terminate. Popen.wait(timeout)
@@ -93,13 +96,9 @@ def fuse_test_marker():
     def skip(reason: str):
         return pytest.mark.skip(reason=reason)
 
-    with subprocess.Popen(
-        ["which", "fusermount"], stdout=subprocess.PIPE, universal_newlines=True
-    ) as which:
-        fusermount_path = which.communicate()[0].strip()
-
-    if not fusermount_path or which.returncode != 0:
-        return skip("Can't find fusermount executable")
+    fusermount_path = shutil.which(FUSERMOUNT_BIN)
+    if not fusermount_path:
+        return skip(f"Can't find {FUSERMOUNT_BIN} executable")
 
     if not os.path.exists("/dev/fuse"):
         return skip("FUSE kernel module does not seem to be loaded")
@@ -140,7 +139,7 @@ def _check_ssh_localhost():
     global _ssh_checked, _ssh_available
     if _ssh_checked:
         if not _ssh_available:
-            pytest.skip("Unable to ssh into localhost without password prompt.")
+            pytest.fail("Unable to ssh into localhost without password prompt.")
         return
     _ssh_checked = True
     try:
@@ -156,7 +155,7 @@ def _check_ssh_localhost():
         res = 1
     if res != 0:
         _ssh_available = False
-        pytest.skip("Unable to ssh into localhost without password prompt.")
+        pytest.fail("Unable to ssh into localhost without password prompt.")
     _ssh_available = True
 
 
