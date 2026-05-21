@@ -821,7 +821,7 @@ def test_git_workflow(tmpdir, capfd):
 
         # Clone into the sshfs mount using file:// URL
         repo_on_mount = os.path.join(mnt_dir, 'repo')
-        subprocess.check_call(['git', 'clone', f'file://{temp_repo}', repo_on_mount])
+        subprocess.check_call(['git', 'clone', f'file://{temp_repo}', repo_on_mount], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
         # Configure identity in the cloned repo
         subprocess.check_call(['git', '-C', repo_on_mount, 'config', 'user.email', 'test@example.com'])
@@ -840,7 +840,20 @@ def test_git_workflow(tmpdir, capfd):
         # Verify commit appears in log
         log = subprocess.check_output(['git', '-C', repo_on_mount, 'log', '--oneline'], text=True)
         assert 'add newfile' in log
-    except:
+
+        # Verify committed content can be read back through the mount
+        with open(os.path.join(repo_on_mount, 'newfile.txt'), 'rb') as fh:
+            assert fh.read() == b'hello from test\n'
+
+        # Test git diff
+        with open(os.path.join(repo_on_mount, 'newfile.txt'), 'wb') as fh:
+            fh.write(b'modified content\n')
+        diff_out = subprocess.check_output(
+            ['git', '-C', repo_on_mount, 'diff'],
+            stderr=subprocess.DEVNULL,
+        )
+        assert b'modified content' in diff_out, 'git diff should show the modification'
+    except Exception:
         cleanup(mount_process, mnt_dir)
         raise
     else:
