@@ -25,7 +25,6 @@ from util import (
     safe_sleep,
     os_create,
     os_open,
-    _check_ssh_localhost,
     _mount_sshfs,
 )
 from os.path import join as pjoin
@@ -877,6 +876,75 @@ def test_direct_io(tmpdir, capfd):
             assert fh.read() == data
 
         os.unlink(mnt_name)
+    except Exception:
+        cleanup(mount_process, mnt_dir)
+        raise
+    else:
+        umount(mount_process, mnt_dir)
+
+
+def _find_fixture(rel_path):
+    """Find a test fixture by searching several candidate locations.
+
+    Needed because pytest may run from the meson build directory where test
+    scripts are copied but fixture directories are not.
+    """
+    # 1. Next to this script (running directly from the source tree)
+    candidate = os.path.join(os.path.dirname(os.path.abspath(__file__)), rel_path)
+    if os.path.exists(candidate):
+        return candidate
+
+    # 2. MESON_SOURCE_ROOT, when set by the meson test runner
+    meson_src = os.environ.get("MESON_SOURCE_ROOT")
+    if meson_src:
+        candidate = os.path.join(meson_src, "test", rel_path)
+        if os.path.exists(candidate):
+            return candidate
+
+    # 3. Walk up two levels from __file__ to reach the source root
+    #    (handles build/test/ layout)
+    source_root = os.path.normpath(
+        os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..")
+    )
+    candidate = os.path.join(source_root, "test", rel_path)
+    if os.path.exists(candidate):
+        return candidate
+
+    raise FileNotFoundError(f"Test fixture not found: {rel_path}")
+
+
+def test_compile_c_project(tmpdir, capfd):
+    capfd.register_output(r"^Warning: Permanently added 'localhost' .+", count=0)
+
+    if not shutil.which("make"):
+        pytest.skip("make not available")
+    if not shutil.which("gcc"):
+        pytest.skip("gcc not available")
+
+    try:
+        fixture_dir = _find_fixture(os.path.join("fixtures", "hello_c"))
+    except FileNotFoundError:
+        pytest.skip("hello_c fixture not found")
+
+    mount_process, mnt_dir, src_dir = _mount_sshfs(tmpdir)
+    try:
+        # Copy fixture to the mount (skip VCS noise)
+        project_dir = pjoin(mnt_dir, "hello_c")
+        shutil.copytree(
+            fixture_dir,
+            project_dir,
+            ignore=shutil.ignore_patterns(".git", ".gitignore"),
+        )
+
+        # Compile on the mount
+        subprocess.check_call(["make", "-j4", "-C", project_dir])
+
+        # Verify the binary exists and produces the expected output
+        binary = pjoin(project_dir, "hello")
+        assert os.path.isfile(binary), "compiled binary not found"
+
+        output = subprocess.check_output([binary], text=True)
+        assert "Hello, world!" in output, f"unexpected output: {output!r}"
     except Exception:
         cleanup(mount_process, mnt_dir)
         raise
