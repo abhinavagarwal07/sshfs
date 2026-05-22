@@ -1090,6 +1090,7 @@ static struct conn* get_conn(const struct sshfs_file *sf,
 
 	int best_index = 0;
 	uint64_t best_score = ~0ULL; /* smaller is better */
+	pthread_mutex_lock(&sshfs.lock);
 	for (i = 0; i < sshfs.max_conns; i++) {
 		uint64_t score = ((uint64_t) sshfs.conns[i].req_count << 43) +
 				 ((uint64_t) sshfs.conns[i].dir_count << 22) +
@@ -1100,6 +1101,7 @@ static struct conn* get_conn(const struct sshfs_file *sf,
 			best_score = score;
 		}
 	}
+	pthread_mutex_unlock(&sshfs.lock);
 	return &sshfs.conns[best_index];
 }
 
@@ -1570,6 +1572,7 @@ static int process_one_request(struct conn *conn)
 			DEBUG("  [%05i] %14s %8ubytes (%ims)\n", id,
 			      type_name(type), msgsize, difftime);
 
+			pthread_mutex_lock(&sshfs.lock);
 			if (difftime < sshfs.min_rtt || !sshfs.num_received)
 				sshfs.min_rtt = difftime;
 			if (difftime > sshfs.max_rtt)
@@ -1577,6 +1580,7 @@ static int process_one_request(struct conn *conn)
 			sshfs.total_rtt += difftime;
 			sshfs.num_received++;
 			sshfs.bytes_received += msgsize;
+			pthread_mutex_unlock(&sshfs.lock);
 		}
 		req->reply = buf;
 		req->reply_type = type;
