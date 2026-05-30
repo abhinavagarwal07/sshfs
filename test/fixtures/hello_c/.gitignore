@@ -1,0 +1,2 @@
+# Allow the Makefile fixture to be tracked despite root-level ignore rule
+!Makefile
