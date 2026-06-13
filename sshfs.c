@@ -1190,6 +1190,17 @@ static int read_all_retry(int fd, void *buf, size_t size)
 	return 0;
 }
 
+static pid_t waitpid_retry(pid_t pid, int *status, int options)
+{
+	pid_t res;
+
+	do {
+		res = waitpid(pid, status, options);
+	} while (res == -1 && errno == EINTR);
+
+	return res;
+}
+
 static int start_ssh(struct conn *conn)
 {
 	char *ptyname = NULL;
@@ -1315,7 +1326,8 @@ static int start_ssh(struct conn *conn)
 			sshfs.ssh_args.argv[0], strerror(errno));
 		_exit(1);
 	}
-	waitpid(pid, NULL, 0);
+	if (waitpid_retry(pid, NULL, 0) == -1)
+		perror("waitpid");
 	close(sockpair[1]);
 	close(pidpipe[1]);
 	if (read_all_retry(pidpipe[0], &conn->ssh_pid,
@@ -1758,11 +1770,14 @@ static void *process_requests(void *data_)
 	subtract_outstanding_locked(ctx.removed_len);
 	pthread_cond_broadcast(&sshfs.outstanding_cond);
 	invalidate_cache = sshfs.reconnect && sshfs.dir_cache;
-	pthread_mutex_unlock(&sshfs.lock);
-
-	/* Lock order: never call cache code while holding sshfs.lock. */
+	/*
+	 * Keep cache hits from observing pre-reconnect entries after connver is
+	 * advanced.  This relies on cache.c never calling back into sshfs while
+	 * holding cache.lock.
+	 */
 	if (invalidate_cache)
 		cache_invalidate_connection();
+	pthread_mutex_unlock(&sshfs.lock);
 
 	if (!sshfs.reconnect) {
 		/* harakiri */
@@ -3742,10 +3757,12 @@ static int sshfs_getattr(const char *path, struct stat *stbuf,
 	struct buffer outbuf;
 	struct sshfs_file *sf = NULL;
 
-	if (fi != NULL && !sshfs.fstat_workaround) {
+	if (fi != NULL) {
 		sf = get_sshfs_file(fi);
 		if (!sshfs_file_is_conn(sf))
 			return -EIO;
+		if (sshfs.fstat_workaround)
+			sf = NULL;
 	}
 
 	buf_init(&buf, 0);
