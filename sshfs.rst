@@ -86,7 +86,9 @@ Options
 -o reconnect
    automatically reconnect to server if connection is
    interrupted. Attempts to access files that were opened before the
-   reconnection will give errors and need to be re-opened.
+   reconnection will give errors and need to be re-opened. Directory
+   handles from before the reconnect are also considered stale and must
+   be reopened.
 
 -o delay_connect
    Don't immediately connect to server, wait until mountpoint is first
@@ -207,7 +209,9 @@ Options
    Enables (*yes*) or disables (*no*) the SSHFS directory cache.  The
    directory cache holds the names of directory entries. Enabling it
    allows `readdir(3)` system calls to be processed without network
-   access.
+   access. When ``-o reconnect`` is active, SSHFS clears the directory
+   cache after a reconnect so entries from the previous SFTP session are
+   not reused.
 
 -o dcache_max_size=N
    sets the maximum size of the directory cache.
