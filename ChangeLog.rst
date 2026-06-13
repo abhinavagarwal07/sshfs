@@ -7,7 +7,8 @@ Unreleased
 * Made stale file and directory handles fail locally after reconnect instead
   of sending old SFTP handle strings to a new server session. This can make
   open/opendir races fail with EIO where they previously returned a doomed
-  handle.
+  handle, and makes fstat on a stale open file fail even when
+  ``workaround=fstat`` is enabled.
 * Purged the directory cache on reconnect and prevented in-flight directory
   and symlink lookups from publishing pre-reconnect data after the purge.
   With multiple connections this conservatively clears the whole directory
