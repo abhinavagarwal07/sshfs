@@ -138,6 +138,14 @@ void cache_invalidate(const char *path)
 	pthread_mutex_unlock(&cache.lock);
 }
 
+void cache_invalidate_connection(void)
+{
+	pthread_mutex_lock(&cache.lock);
+	g_hash_table_remove_all(cache.table);
+	cache.write_ctr++;
+	pthread_mutex_unlock(&cache.lock);
+}
+
 static void cache_invalidate_write(const char *path)
 {
 	pthread_mutex_lock(&cache.lock);
@@ -202,11 +210,17 @@ void cache_add_attr(const char *path, const struct stat *stbuf, uint64_t wrctr)
 	pthread_mutex_unlock(&cache.lock);
 }
 
-static void cache_add_dir(const char *path, GPtrArray *dir)
+static void cache_add_dir(const char *path, GPtrArray *dir, uint64_t wrctr)
 {
 	struct node *node;
 
 	pthread_mutex_lock(&cache.lock);
+	if (wrctr != cache.write_ctr) {
+		pthread_mutex_unlock(&cache.lock);
+		g_ptr_array_free(dir, TRUE);
+		return;
+	}
+
 	node = cache_get(path);
 	if (node->dir != NULL) {
 		g_ptr_array_free(node->dir, TRUE);
@@ -226,11 +240,17 @@ static size_t my_strnlen(const char *s, size_t maxsize)
 	return p - s;
 }
 
-static void cache_add_link(const char *path, const char *link, size_t size)
+static void cache_add_link(const char *path, const char *link, size_t size,
+			   uint64_t wrctr)
 {
 	struct node *node;
 
 	pthread_mutex_lock(&cache.lock);
+	if (wrctr != cache.write_ctr) {
+		pthread_mutex_unlock(&cache.lock);
+		return;
+	}
+
 	node = cache_get(path);
 	g_free(node->link);
 	node->link = g_strndup(link, my_strnlen(link, size-1));
@@ -298,6 +318,7 @@ static int cache_readlink(const char *path, char *buf, size_t size)
 {
 	struct node *node;
 	int err;
+	uint64_t wrctr;
 
 	pthread_mutex_lock(&cache.lock);
 	node = cache_lookup(path);
@@ -311,9 +332,10 @@ static int cache_readlink(const char *path, char *buf, size_t size)
 		}
 	}
 	pthread_mutex_unlock(&cache.lock);
+	wrctr = cache_get_write_ctr();
 	err = cache.next_oper->readlink(path, buf, size);
 	if (!err)
-		cache_add_link(path, buf, size);
+		cache_add_link(path, buf, size, wrctr);
 
 	return err;
 }
@@ -425,7 +447,7 @@ static int cache_readdir(const char *path, void *buf, fuse_fill_dir_t filler,
 	g_ptr_array_add(ch.dir, NULL);
 	dir = ch.dir;
 	if (!err) {
-		cache_add_dir(path, dir);
+		cache_add_dir(path, dir, ch.wrctr);
 	} else {
 		g_ptr_array_free(dir, TRUE);
 	}
