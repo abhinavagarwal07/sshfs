@@ -1,0 +1,155 @@
+name: macos build
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  MACFUSE_VERSION: "5.4.0"
+  MACFUSE_SHA256: 861814f0ac7fa8f6547ea40cdd49a36ac84bcc7d34f38a1fa74e8cf68b0401c5
+  HOMEBREW_NO_AUTO_UPDATE: "1"
+  HOMEBREW_NO_INSTALL_CLEANUP: "1"
+  HOMEBREW_NO_ENV_HINTS: "1"
+  HOMEBREW_NO_ANALYTICS: "1"
+
+jobs:
+  build:
+    name: ${{ matrix.runner }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [macos-15, macos-26]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.12'
+
+      - name: Install macFUSE
+        timeout-minutes: 5
+        run: |
+          set -euxo pipefail
+          dmg="$RUNNER_TEMP/macfuse.dmg"
+          curl -fsSL --retry 3 -o "$dmg" "https://github.com/macfuse/macfuse/releases/download/macfuse-${MACFUSE_VERSION}/macfuse-${MACFUSE_VERSION}.dmg"
+          echo "${MACFUSE_SHA256}  $dmg" | shasum -a 256 -c -
+          hdiutil attach "$dmg" -nobrowse -readonly -mountpoint "$RUNNER_TEMP/macfuse"
+          sudo installer -pkg "$RUNNER_TEMP/macfuse/Extras/macFUSE ${MACFUSE_VERSION}.pkg" -target /
+          hdiutil detach "$RUNNER_TEMP/macfuse"
+          ls -l /usr/local/lib/pkgconfig/fuse3.pc /usr/local/lib/libfuse3.dylib
+          cat /usr/local/lib/pkgconfig/fuse3.pc
+
+      - name: Install build dependencies
+        timeout-minutes: 5
+        run: |
+          brew install glib
+          pip3 install meson==1.12.1 docutils==0.23 pytest==9.1.1 pytest-timeout==2.4.0
+
+      - name: Print tool versions
+        run: |
+          sw_vers
+          uname -m
+          clang --version
+          meson --version
+          ninja --version
+          pkg-config --version
+
+      - name: Build
+        env:
+          # macFUSE installs its pkg-config files here; Homebrew's pkg-config
+          # does not look in /usr/local on Apple Silicon.
+          PKG_CONFIG_PATH: /usr/local/lib/pkgconfig
+        run: |
+          meson setup build
+          ninja -C build
+
+      - name: Run cache unit tests
+        run: |
+          set -o pipefail
+          meson test -C build --suite unit --print-errorlogs -v | tee build/unit-tests.log
+          # Older Meson versions succeed when the suite is missing.
+          grep -Eiq '^ok: +[1-9]' build/unit-tests.log
+          python3 - <<'PY'
+          import os
+          import re
+          from pathlib import Path
+
+          log = Path('build/unit-tests.log').read_text()
+          cases = re.findall(r'^ok \d+ - .+$', log, re.M)
+          if not cases:
+              raise SystemExit('::error::no cache unit cases ran')
+          xfails = sum('# XFAIL ' in case for case in cases)
+          summary = f'Cache unit cases: {len(cases) - xfails} passed, {xfails} expected failures.\n'
+          print(summary)
+          with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as out:
+              out.write(summary)
+          PY
+
+      - name: Run mount-free tests
+        id: no_mount
+        timeout-minutes: 2
+        run: |
+          cd build
+          python3 -m pytest test/test_hostname_validation.py --timeout=30 --junitxml=test-results.xml
+
+      - name: Check mount-free test results
+        if: ${{ !cancelled() && steps.no_mount.outcome != 'skipped' }}
+        run: |
+          python3 - <<'PY'
+          import os
+          import xml.etree.ElementTree as ET
+
+          cases = list(ET.parse('build/test-results.xml').getroot().iter('testcase'))
+          required = {'test_reject_option_injection_in_hostname', 'test_reject_dash_host_after_doubledash'}
+          missing = required - {case.get('name') for case in cases}
+          bad = [case.get('name') for case in cases
+                 if any(case.find(tag) is not None for tag in ('skipped', 'failure', 'error'))]
+          summary = f'Mount-free tests: {len(cases) - len(bad)} passed, {len(bad)} skipped or failed.\n'
+          print(summary)
+          with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as out:
+              out.write(summary)
+          if missing or bad:
+              raise SystemExit(f'::error::missing tests: {sorted(missing)}; skipped or failed: {bad}')
+          PY
+
+      - name: Smoke test
+        run: |
+          set -o pipefail
+          ./build/sshfs --version | tee version.txt
+          grep -q '^SSHFS version ' version.txt
+          grep -q '^FUSE library version ' version.txt
+          test -s build/sshfs.1
+          otool -L build/sshfs
+
+          # no mount is possible on a hosted runner, so check that startup
+          # runs through to a clean ssh failure
+          mkdir "$RUNNER_TEMP/mnt"
+          rc=0
+          perl -e 'alarm 30; exec @ARGV' ./build/sshfs -f -o ssh_command=/dev/null localhost:/ "$RUNNER_TEMP/mnt" 2> err.txt || rc=$?
+          cat err.txt
+          [ "$rc" -eq 1 ] || { echo "expected exit 1, got $rc"; exit 1; }
+          grep -q "failed to execute '/dev/null'" err.txt
+
+      - name: Upload build logs
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: build-logs-${{ matrix.runner }}
+          path: |
+            build/test-results.xml
+            build/unit-tests.log
+            build/meson-logs/
