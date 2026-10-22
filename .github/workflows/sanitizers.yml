@@ -43,7 +43,7 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y clang llvm ninja-build pkg-config libglib2.0-dev libfuse3-dev fuse3 openssh-client openssh-server
+          sudo apt-get install -y clang llvm ninja-build pkg-config libglib2.0-dev libfuse3-dev fuse3 openssh-client openssh-server rsync git make
           pip3 install meson pytest pytest-timeout
 
       - name: Setup SSH

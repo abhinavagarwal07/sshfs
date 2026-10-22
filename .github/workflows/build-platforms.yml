@@ -50,7 +50,7 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y gcc ninja-build pkg-config libglib2.0-dev libfuse3-dev ${{ matrix.run_tests && 'openssh-server openssh-client fuse3' || '' }}
+          sudo apt-get install -y gcc ninja-build pkg-config libglib2.0-dev libfuse3-dev ${{ matrix.run_tests && 'openssh-server openssh-client fuse3 rsync git make' || '' }}
           pip3 install meson ${{ matrix.run_tests && 'pytest pytest-timeout' || '' }}
 
       - name: Build
