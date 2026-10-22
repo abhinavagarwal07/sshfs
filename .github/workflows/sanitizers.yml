@@ -71,6 +71,16 @@ jobs:
           meson setup build -Db_sanitize=${{ matrix.san_flag }} -Db_lundef=false -Dwerror=true
           ninja -C build
 
+      - name: Cache unit tests
+        env:
+          ASAN_OPTIONS: "${{ matrix.sanitizer == 'asan' && format('{0}:log_path={1}/sanitizer/asan', matrix.san_opts, runner.temp) || '' }}"
+          LSAN_OPTIONS: "${{ matrix.sanitizer == 'asan' && format('suppressions={0}/test/lsan_suppress.txt', github.workspace) || '' }}"
+          UBSAN_OPTIONS: "${{ matrix.sanitizer == 'ubsan' && format('{0}:log_path={1}/sanitizer/ubsan', matrix.san_opts, runner.temp) || '' }}"
+          ASAN_SYMBOLIZER_PATH: /usr/bin/llvm-symbolizer
+        run: |
+          mkdir -p "$RUNNER_TEMP/sanitizer"
+          meson test -C build cache --print-errorlogs -v
+
       - name: Test
         env:
           ASAN_OPTIONS: "${{ matrix.sanitizer == 'asan' && format('{0}:log_path={1}/sanitizer/asan', matrix.san_opts, runner.temp) || '' }}"

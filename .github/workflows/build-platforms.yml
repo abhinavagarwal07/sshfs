@@ -60,6 +60,10 @@ jobs:
           meson setup build ${{ matrix.buildtype && format('--buildtype={0}', matrix.buildtype) || '' }}
           ninja -C build
 
+      - name: Run cache unit tests
+        if: matrix.run_tests
+        run: meson test -C build cache --print-errorlogs -v
+
       - name: Setup SSH
         if: matrix.run_tests
         run: |
