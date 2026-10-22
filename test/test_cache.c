@@ -142,6 +142,7 @@ static struct {
 static void (*hook_getattr)(void);	/* runs once, inside the next getattr */
 static void (*hook_readdir)(void);	/* runs once, inside the next readdir */
 static void (*hook_readlink)(void);	/* runs once, inside the next readlink */
+static void (*hook_opendir)(void);	/* runs once, inside the next opendir */
 static int readdir_fail_at;		/* fail with EIO before this entry */
 static int readdir_no_attrs;
 static off_t last_readdir_offset;
@@ -351,6 +352,8 @@ static int fake_opendir(const char *path, struct fuse_file_info *fi)
 	(void) path;
 	calls.opendir++;
 	fi->fh = 42;
+	/* the backend has its handle; anything that happens now comes too late */
+	run_hook(&hook_opendir);
 	return 0;
 }
 
@@ -611,6 +614,7 @@ static void reset_state(void)
 	hook_getattr = NULL;
 	hook_readdir = NULL;
 	hook_readlink = NULL;
+	hook_opendir = NULL;
 	readdir_fail_at = -1;
 	readdir_no_attrs = 0;
 	next_ino = 100;
@@ -626,6 +630,7 @@ static void reset_state(void)
 	cache.min_clean_interval_secs = 5;
 	cache.last_cleaned = T0;
 	cache.write_ctr = 0;
+	cache.conn_epoch = 0;
 	mk_dir("/");
 }
 
@@ -1400,6 +1405,58 @@ static void test_write_guard_readdir(void)
 	CHECK(S_ISREG(l.mode[b]) && l.ino[b] == ino_b && l.size[b] == 2);
 }
 
+/* ---- calls in flight across a reconnect ---- */
+
+static void hook_reconnect(void)
+{
+	cache_invalidate_connection();
+}
+
+static void test_reconnect_readdir(void)
+{
+	struct listing l;
+
+	mk_dir("/d");
+	mk_file("/d/a", 1);
+	hook_readdir = hook_reconnect;
+
+	REQUIRE(do_readdir("/d", 0, &l) == 0);
+	CHECK(l.n == 1);	/* the listing in flight is still delivered */
+
+	/* but neither it nor the attributes that came with it were cached */
+	CHECK(cache_lookup("/d/a") == NULL);
+	CHECK(probe_dir("/d"));
+	CHECK(!probe_dir("/d"));
+}
+
+static void test_reconnect_opendir(void)
+{
+	struct listing l;
+
+	mk_dir("/d");
+	mk_file("/d/a", 1);
+	hook_opendir = hook_reconnect;
+
+	/* the handle is from the old session, whatever the listing says */
+	REQUIRE(do_readdir("/d", 0, &l) == 0);
+	CHECK(cache_lookup("/d/a") == NULL);
+	CHECK(probe_dir("/d"));
+	CHECK(!probe_dir("/d"));
+}
+
+static void test_reconnect_readlink(void)
+{
+	char buf[64];
+
+	mk_link("/l", "target");
+	hook_readlink = hook_reconnect;
+
+	REQUIRE(ops->readlink("/l", buf, sizeof(buf)) == 0);
+	CHECK(strcmp(buf, "target") == 0);
+	CHECK(probe_link("/l"));
+	CHECK(!probe_link("/l"));
+}
+
 /* ---- calls in flight across operations that do not bump write_ctr ---- */
 
 static void hook_mkdir_new(void)
@@ -1705,6 +1762,12 @@ static const struct tcase cases[] = {
 	  test_write_guard_api, NULL },
 	{ "write counter: readdir in flight across a write drops child attrs",
 	  test_write_guard_readdir, NULL },
+	{ "reconnect: listing in flight is not cached, nor its attrs",
+	  test_reconnect_readdir, NULL },
+	{ "reconnect: a handle opened before it fills nothing",
+	  test_reconnect_opendir, NULL },
+	{ "reconnect: link in flight is not cached",
+	  test_reconnect_readlink, NULL },
 	{ "stale install: readdir in flight across mkdir (cache layer only)",
 	  test_race_readdir_mkdir,
 	  "cache_add_dir has no generation check; one Linux mount serialises this pair" },

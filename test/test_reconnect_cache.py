@@ -7,6 +7,7 @@ if __name__ == "__main__":
     sys.exit(pytest.main([__file__] + sys.argv[1:]))
 
 import os
+import shlex
 import signal
 import time
 from contextlib import contextmanager
@@ -35,7 +36,7 @@ def _write_ssh_wrapper(tmpdir):
     with open(wrapper, "w", encoding="utf-8") as fh:
         fh.write(
             "#!/bin/sh\n"
-            f"printf '%s\\n' \"$$\" > '{pidfile}'\n"
+            f"printf '%s\\n' \"$$\" > {shlex.quote(pidfile)}\n"
             'exec ssh "$@"\n'
         )
     os.chmod(wrapper, 0o755)
