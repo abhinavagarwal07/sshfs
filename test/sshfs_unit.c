@@ -389,9 +389,9 @@ int main(void)
 	if (processing_init() == -1)
 		return t_fail("processing_init failed");
 
-	if (t_test_teardown_keeps_other_connections() != 0)
-		return 1;
 	if (t_test_failed_send_is_refunded() != 0)
+		return 1;
+	if (t_test_teardown_keeps_other_connections() != 0)
 		return 1;
 
 	return 0;
