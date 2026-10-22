@@ -60,9 +60,13 @@ jobs:
           meson setup build ${{ matrix.buildtype && format('--buildtype={0}', matrix.buildtype) || '' }}
           ninja -C build
 
-      - name: Run cache unit tests
+      - name: Run unit tests
         if: matrix.run_tests
-        run: meson test -C build --suite unit --print-errorlogs -v
+        run: |
+          set -o pipefail
+          meson test -C build --suite unit --print-errorlogs -v | tee "$RUNNER_TEMP/unit-tests.log"
+          # old meson exits 0 when the suite is missing, so insist on a pass
+          grep -Eq '^Ok: +[1-9]' "$RUNNER_TEMP/unit-tests.log"
 
       - name: Setup SSH
         if: matrix.run_tests

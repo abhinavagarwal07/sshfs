@@ -71,7 +71,7 @@ jobs:
           meson setup build -Db_sanitize=${{ matrix.san_flag }} -Db_lundef=false -Dwerror=true
           ninja -C build
 
-      - name: Cache unit tests
+      - name: Unit tests
         env:
           ASAN_OPTIONS: "${{ matrix.sanitizer == 'asan' && format('{0}:log_path={1}/sanitizer/asan', matrix.san_opts, runner.temp) || '' }}"
           LSAN_OPTIONS: "${{ matrix.sanitizer == 'asan' && format('suppressions={0}/test/lsan_suppress.txt', github.workspace) || '' }}"
@@ -79,7 +79,10 @@ jobs:
           ASAN_SYMBOLIZER_PATH: /usr/bin/llvm-symbolizer
         run: |
           mkdir -p "$RUNNER_TEMP/sanitizer"
-          meson test -C build --suite unit --print-errorlogs -v
+          set -o pipefail
+          meson test -C build --suite unit --print-errorlogs -v | tee "$RUNNER_TEMP/unit-tests.log"
+          # old meson exits 0 when the suite is missing, so insist on a pass
+          grep -Eq '^Ok: +[1-9]' "$RUNNER_TEMP/unit-tests.log"
 
       - name: Test
         env:
