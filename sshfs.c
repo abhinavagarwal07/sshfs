@@ -477,6 +477,7 @@ enum {
 	KEY_PORT,
 	KEY_COMPRESS,
 	KEY_CONFIGFILE,
+	KEY_OBSOLETE,
 };
 
 enum {
@@ -548,6 +549,11 @@ static struct fuse_opt sshfs_opts[] = {
 
 	FUSE_OPT_KEY("writeback_cache=no", FUSE_OPT_KEY_DISCARD),
 	FUSE_OPT_KEY("unreliable_append", FUSE_OPT_KEY_DISCARD),
+
+	/* libfuse 2 options that libfuse 3 rejects but guides still use */
+	FUSE_OPT_KEY("nonempty", KEY_OBSOLETE),
+	FUSE_OPT_KEY("big_writes", KEY_OBSOLETE),
+	FUSE_OPT_KEY("large_read", KEY_OBSOLETE),
 
 	/* These may come in from /etc/fstab - we just ignore them */
 	FUSE_OPT_KEY("auto", FUSE_OPT_KEY_DISCARD),
@@ -4018,6 +4024,11 @@ static int sshfs_opt_proc(void *data, const char *arg, int key,
 		tmp = g_strdup_printf("-F%s", arg + 2);
 		ssh_add_arg(tmp);
 		g_free(tmp);
+		return 0;
+
+	case KEY_OBSOLETE:
+		fprintf(stderr, "sshfs: option '%s' is obsolete and ignored\n",
+			arg);
 		return 0;
 
 	default:

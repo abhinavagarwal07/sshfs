@@ -247,6 +247,12 @@ Options
    connection, the *password_stdin* and *passive* options can not be
    used, and the *buflimit* workaround is not supported.
 
+-o nonempty, -o big_writes, -o large_read
+   libfuse 2 options that old guides still use. libfuse 3 made them
+   redundant (mounting over a non-empty directory and big writes are
+   always on, large_read was for Linux 2.4), so SSHFS ignores them and
+   prints a note.
+
 In addition, SSHFS accepts several options common to all FUSE file
 systems. These are described in the `mount.fuse` manpage (look
 for "general", "libfuse specific", and "high-level API" options).
