@@ -5,16 +5,54 @@ on:
     branches: [master]
   pull_request:
   workflow_dispatch:
+    inputs:
+      git-ref:
+        description: Git ref to test, e.g. refs/pull/123/merge (optional)
+        required: false
 
 permissions:
   contents: read
 
+# nothing here needs to save a cache, and dispatch runs may build other refs
+cache-mode: read
+
 concurrency:
-  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  # dispatch runs get their own group so they can't cancel (or be cancelled by)
+  # the run for the branch they were started from
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || (github.event_name == 'workflow_dispatch' && format('dispatch-{0}', inputs.git-ref || github.ref)) || github.ref }}
   cancel-in-progress: true
 
 jobs:
+  # Pin a dispatched ref to one commit, so every job tests the same thing even
+  # if refs/pull/N/merge moves while the run is going. git-ref is a full ref
+  # name or a commit SHA.
+  resolve:
+    name: resolve ref
+    if: github.event_name == 'workflow_dispatch' && inputs.git-ref != ''
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      sha: ${{ steps.resolve.outputs.sha }}
+    steps:
+      - id: resolve
+        env:
+          GIT_REF: ${{ inputs.git-ref }}
+        run: |
+          if [[ "$GIT_REF" =~ ^[0-9a-f]{40}$ ]]; then
+            sha=$GIT_REF
+          else
+            sha=$(git ls-remote "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY" "$GIT_REF" | awk 'NR == 1 { print $1 }')
+          fi
+          if ! [[ "$sha" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "can't resolve $GIT_REF" >&2
+            exit 1
+          fi
+          echo "$GIT_REF is $sha"
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+
   sanitize:
+    needs: resolve
+    if: ${{ !failure() && !cancelled() }}
     name: ${{ matrix.name }}
     runs-on: ubuntu-24.04
     timeout-minutes: 30
@@ -34,6 +72,14 @@ jobs:
             extra_cflags: "-fno-omit-frame-pointer"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.resolve.outputs.sha }}
+          persist-credentials: false
+
+      - name: Show tested commit
+        run: |
+          git rev-parse HEAD
+          git cat-file -p HEAD | grep '^parent ' || true
 
       - name: Set up Python
         uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
@@ -44,7 +90,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y clang llvm ninja-build pkg-config libglib2.0-dev libfuse3-dev fuse3 openssh-client openssh-server
-          pip3 install meson pytest pytest-timeout
+          pip3 install meson==1.12.1 pytest==9.1.1 pytest-timeout==2.4.0
 
       - name: Setup SSH
         run: |
