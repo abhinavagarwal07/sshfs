@@ -30,6 +30,7 @@ from util import (
     SSH_LOCALHOST,
     _check_ssh_localhost,
     _mount_sshfs,
+    mounted,
 )
 from os.path import join as pjoin
 
@@ -858,8 +859,7 @@ def test_disable_hardlink(tmpdir, capfd):
 
 def test_follow_symlinks(tmpdir, capfd):
     capfd.register_output(r"^Warning: Permanently added 'localhost' .+", count=0)
-    mount_process, mnt_dir, src_dir = _mount_sshfs(tmpdir, ["follow_symlinks"])
-    try:
+    with mounted(tmpdir, ["follow_symlinks"]) as (mnt_dir, src_dir):
         target_name = name_generator()
         target = pjoin(src_dir, target_name)
         with open(target, "wb") as fh:
@@ -878,17 +878,11 @@ def test_follow_symlinks(tmpdir, capfd):
 
         os.unlink(link)
         os.unlink(target)
-    except Exception:
-        cleanup(mount_process, mnt_dir)
-        raise
-    else:
-        umount(mount_process, mnt_dir)
 
 
 def test_direct_io(tmpdir, capfd):
     capfd.register_output(r"^Warning: Permanently added 'localhost' .+", count=0)
-    mount_process, mnt_dir, src_dir = _mount_sshfs(tmpdir, ["direct_io"])
-    try:
+    with mounted(tmpdir, ["direct_io"]) as (mnt_dir, src_dir):
         name = name_generator()
         mnt_name = pjoin(mnt_dir, name)
         src_name = pjoin(src_dir, name)
@@ -902,11 +896,6 @@ def test_direct_io(tmpdir, capfd):
             assert fh.read() == data
 
         os.unlink(mnt_name)
-    except Exception:
-        cleanup(mount_process, mnt_dir)
-        raise
-    else:
-        umount(mount_process, mnt_dir)
 
 
 def test_bad_sftp_reply_len(tmpdir):
