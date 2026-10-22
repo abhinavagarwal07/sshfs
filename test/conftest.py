@@ -1,7 +1,27 @@
+import os
 import sys
 import pytest
 import time
 import re
+
+from util import require_macfuse_lazy_mount
+
+# These need macFUSE 5.3.3+, whose mount is delayed so that nothing is mounted
+# on a runner. On macOS they are only collected with TEST_WITH_MACFUSE=1;
+# test_startup.py also runs elsewhere, against a FUSE mount.
+MACFUSE_TESTS = ("test_macos_daemonize", "test_startup")
+
+if sys.platform != "darwin":
+    collect_ignore = ["test_macos_daemonize.py"]
+elif os.environ.get("TEST_WITH_MACFUSE") != "1":
+    collect_ignore = [name + ".py" for name in MACFUSE_TESTS]
+
+
+@pytest.fixture(scope="module", autouse=True)
+def macfuse_prerequisite(request):
+    if sys.platform == "darwin" and request.module.__name__ in MACFUSE_TESTS:
+        require_macfuse_lazy_mount()
+
 
 # If a test fails, wait a moment before retrieving the captured stdout/stderr.
 # When using a server process, this makes sure that we capture any potential
