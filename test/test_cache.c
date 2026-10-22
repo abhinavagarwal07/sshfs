@@ -262,6 +262,25 @@ static nlink_t count_names(ino_t ino)
 	return n;
 }
 
+/* a change made through one name of a file shows through its other names */
+static void sync_inode(const struct fent *src)
+{
+	int i;
+
+	for (i = 0; i < MAX_ENT; i++) {
+		struct fent *o = &ents[i];
+
+		if (!o->used || o == src || o->ino != src->ino)
+			continue;
+		o->mode = src->mode;
+		o->size = src->size;
+		o->uid = src->uid;
+		o->gid = src->gid;
+		o->atime = src->atime;
+		o->mtime = src->mtime;
+	}
+}
+
 static void fill_stat(struct stat *st, const struct fent *e)
 {
 	memset(st, 0, sizeof(*st));
@@ -411,15 +430,18 @@ static int fake_symlink(const char *from, const char *to)
 
 static int fake_rename(const char *from, const char *to, unsigned int flags)
 {
-	struct fent *old;
+	struct fent *src, *old;
 	size_t n = strlen(from);
 	int i;
 
 	(void) flags;
 	calls.rename++;
-	if (!ent_find(from))
+	src = ent_find(from);
+	if (!src)
 		return -ENOENT;
 	old = ent_find(to);
+	if (old && old->ino == src->ino)	/* the same file: nothing to do */
+		return 0;
 	if (old)
 		old->used = 0;
 	for (i = 0; i < MAX_ENT; i++) {
@@ -466,6 +488,7 @@ static int fake_chmod(const char *path, mode_t mode, struct fuse_file_info *fi)
 	if (!e)
 		return -ENOENT;
 	e->mode = (e->mode & S_IFMT) | (mode & 07777);
+	sync_inode(e);
 	return 0;
 }
 
@@ -483,6 +506,7 @@ static int fake_chown(const char *path, uid_t uid, gid_t gid,
 		e->uid = uid;
 	if (gid != (gid_t) -1)
 		e->gid = gid;
+	sync_inode(e);
 	return 0;
 }
 
@@ -498,6 +522,7 @@ static int fake_utimens(const char *path, const struct timespec tv[2],
 		return -ENOENT;
 	e->atime = tv[0].tv_sec;
 	e->mtime = tv[1].tv_sec;
+	sync_inode(e);
 	return 0;
 }
 
@@ -512,6 +537,7 @@ static int fake_truncate(const char *path, off_t size,
 	if (!e)
 		return -ENOENT;
 	e->size = size;
+	sync_inode(e);
 	return 0;
 }
 
@@ -528,6 +554,7 @@ static int fake_write(const char *path, const char *buf, size_t size,
 		return -ENOENT;
 	if (offset + (off_t) size > e->size)
 		e->size = offset + (off_t) size;
+	sync_inode(e);
 	return (int) size;
 }
 
@@ -917,12 +944,14 @@ static void test_new_values_after_ops(void)
 	REQUIRE(get_cached("/f", &st) == 0);
 	CHECK(st.st_atime == 111 && st.st_mtime == 222);
 
-	/* a second name for the same inode */
+	/* a second name for the same inode; a change via it shows under both */
 	CHECK(ops->link("/f", "/l") == 0);
+	CHECK(ops->chmod("/l", 0640, NULL) == 0);
 	REQUIRE(get_cached("/f", &st) == 0);
 	REQUIRE(get_cached("/l", &st2) == 0);
 	CHECK(st.st_nlink == 2 && st2.st_nlink == 2 && st.st_ino == st2.st_ino);
 	CHECK(st2.st_uid == 1000 && st2.st_mtime == 222);
+	CHECK((st.st_mode & 07777) == 0640 && (st2.st_mode & 07777) == 0640);
 }
 
 static void test_cache_invalidate(void)
@@ -990,6 +1019,12 @@ static void test_rename_over_existing(void)
 	CHECK(size_of("/y") == 7);
 	REQUIRE(ops->rename("/x", "/y", 0) == 0);
 	CHECK(size_of("/y") == 3);
+
+	/* onto itself, or onto another name of the same file: nothing changes */
+	CHECK(ops->rename("/y", "/y", 0) == 0);
+	CHECK(ops->link("/y", "/z") == 0);
+	CHECK(ops->rename("/y", "/z", 0) == 0);
+	CHECK(size_of("/y") == 3 && size_of("/z") == 3);
 }
 
 static void test_failed_ops_keep_cache(void)
@@ -1643,7 +1678,7 @@ static const struct tcase cases[] = {
 	{ "rename: children of the old name are dropped",
 	  test_rename_moves_children, NULL },
 	{ "rename: both parents are purged", test_rename_nested, NULL },
-	{ "rename: an existing target is not served stale",
+	{ "rename: a target is not served stale; onto itself does nothing",
 	  test_rename_over_existing, NULL },
 	{ "invalidate: failed ops leave the cache alone",
 	  test_failed_ops_keep_cache, NULL },
