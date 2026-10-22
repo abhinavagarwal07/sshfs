@@ -4,6 +4,8 @@ on:
   push:
   pull_request:
   workflow_dispatch:
+  schedule:
+    - cron: '0 7 * * 1'
 
 permissions:
   contents: read
@@ -123,6 +125,157 @@ jobs:
         with:
           name: build-logs-alpine-musl
           path: build-alpine/meson-logs/
+
+  # quay.io garbage-collects old digests within weeks, so CentOS is a plain tag.
+  # meson and ninja-build are only in CRB on EL9.
+  centos-stream9:
+    name: centos-stream9
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Build in CentOS Stream 9 container
+        run: |
+          docker run --rm -v "$PWD:/work" -w /work quay.io/centos/centos:stream9 sh -euxc '
+            dnf install -y --enablerepo=crb gcc meson ninja-build pkg-config glib2-devel fuse3-devel
+            meson setup build-centos -Dwerror=true
+            ninja -C build-centos
+          '
+
+      - name: Upload build logs
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: failure()
+        with:
+          name: build-logs-centos-stream9
+          path: build-centos/meson-logs/
+
+  fedora-latest:
+    name: fedora-latest
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Build in Fedora container
+        run: |
+          docker run --rm -v "$PWD:/work" -w /work fedora:latest@sha256:43b29f65a41eb9c35e1cd5323e3bdf3b655c2357a9f4f1ff2f9c2798e5045d80 sh -euxc '
+            dnf install -y gcc meson ninja-build pkg-config glib2-devel fuse3-devel
+            meson setup build-fedora -Dwerror=true
+            ninja -C build-fedora
+          '
+
+      - name: Upload build logs
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: failure()
+        with:
+          name: build-logs-fedora-latest
+          path: build-fedora/meson-logs/
+
+  # Advisory: runs the pytest suite against real FUSE + sshd in a privileged
+  # container. A failure here does not fail the workflow.
+  rpm-runtime:
+    name: ${{ matrix.name }} (runtime)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    continue-on-error: true
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: centos-stream9
+            image: quay.io/centos/centos:stream9
+            dnf_args: --enablerepo=crb
+            # sshd denies root here with pam_acct_mgmt = 9 (PAM_AUTHINFO_UNAVAIL)
+            sshd_args: -o UsePAM=no
+          - name: fedora-latest
+            image: fedora:latest@sha256:43b29f65a41eb9c35e1cd5323e3bdf3b655c2357a9f4f1ff2f9c2798e5045d80
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Build and test in container
+        env:
+          IMAGE: ${{ matrix.image }}
+          DNF_ARGS: ${{ matrix.dnf_args }}
+          SSHD_ARGS: ${{ matrix.sshd_args }}
+        run: |
+          docker run --rm --privileged --device /dev/fuse -e DNF_ARGS -e SSHD_ARGS \
+            -v "$PWD:/work" -w /work "$IMAGE" sh -euxc '
+            # which: test/util.py runs it, and the Fedora image does not ship it
+            dnf install -y $DNF_ARGS gcc meson ninja-build pkg-config glib2-devel fuse3-devel \
+              fuse3 openssh-server openssh-clients python3-pip which
+            pip3 install pytest pytest-timeout
+            meson setup build-rpm
+            ninja -C build-rpm
+            # test/util.py looks for the legacy name and skips the mount tests without it
+            command -v fusermount || ln -s "$(command -v fusermount3)" /usr/local/bin/fusermount
+            mkdir -p ~/.ssh
+            chmod 700 ~/.ssh
+            ssh-keygen -t ed25519 -f ~/.ssh/id_ed25519 -q -N ""
+            cat ~/.ssh/id_ed25519.pub > ~/.ssh/authorized_keys
+            chmod 600 ~/.ssh/authorized_keys
+            ssh-keygen -A
+            touch /work/build-rpm/sshd.log
+            chmod 644 /work/build-rpm/sshd.log
+            /usr/sbin/sshd -E /work/build-rpm/sshd.log -o LogLevel=VERBOSE $SSHD_ARGS
+            ssh -o ConnectionAttempts=10 -o StrictHostKeyChecking=no -o BatchMode=yes localhost true || {
+              ssh -v -o StrictHostKeyChecking=no -o BatchMode=yes localhost true || true
+              cat /work/build-rpm/sshd.log
+              exit 1
+            }
+            cd build-rpm
+            python3 -m pytest test/ --timeout=300 --maxfail=99 --junitxml=test-results.xml
+          '
+
+      # A missing FUSE prerequisite makes the mount tests skip, not fail.
+      - name: Check tests ran and none were skipped
+        run: |
+          python3 - build-rpm/test-results.xml <<'EOF'
+          import sys
+          import xml.etree.ElementTree as ET
+          root = ET.parse(sys.argv[1]).getroot()
+          ran = sum(c.find("skipped") is None for c in root.iter("testcase"))
+          # xfail is reported as skipped too, but it is not a missing prerequisite
+          skipped = sum(1 for s in root.iter("skipped") if s.get("type") != "pytest.xfail")
+          print(f"{ran} tests ran, {skipped} skipped")
+          if ran == 0 or skipped:
+              print(f"::error::{ran} tests ran, {skipped} skipped")
+              sys.exit(1)
+          EOF
+
+      - name: Upload test results
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: test-results-${{ matrix.name }}
+          path: |
+            build-rpm/test-results.xml
+            build-rpm/sshd.log
+            build-rpm/meson-logs/
+
+  fedora-rawhide:
+    name: fedora-rawhide
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Build in Fedora Rawhide container
+        run: |
+          docker run --rm -v "$PWD:/work" -w /work registry.fedoraproject.org/fedora:rawhide sh -euxc '
+            dnf install -y gcc meson ninja-build pkg-config glib2-devel fuse3-devel
+            meson setup build-rawhide -Dwerror=true
+            ninja -C build-rawhide
+          '
+
+      - name: Upload build logs
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: failure()
+        with:
+          name: build-logs-fedora-rawhide
+          path: build-rawhide/meson-logs/
 
   freebsd:
     name: freebsd-14
