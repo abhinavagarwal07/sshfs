@@ -77,6 +77,7 @@ jobs:
       # The mount tests skip when FUSE is unusable, and then the numbers mean
       # nothing. xfails are recorded as skips in the XML but are fine.
       - name: Check that the tests ran
+        id: test_check
         run: |
           python3 - build/test-results.xml <<'PY'
           import sys
@@ -102,6 +103,7 @@ jobs:
         if: ${{ !cancelled() && steps.tests.outcome != 'skipped' }}
         env:
           TESTS_OUTCOME: ${{ steps.tests.outcome }}
+          TEST_CHECK_OUTCOME: ${{ steps.test_check.outcome }}
         run: |
           mkdir coverage
           gcovr --root . --filter 'sshfs\.c' --filter 'cache\.c' \
@@ -110,7 +112,7 @@ jobs:
           {
             echo '### Coverage of sshfs.c and cache.c'
             echo
-            if [ "$TESTS_OUTCOME" != success ]; then
+            if [ "$TESTS_OUTCOME" != success ] || [ "$TEST_CHECK_OUTCOME" != success ]; then
               echo "**The tests did not all pass, so these numbers are partial.**"
               echo
             fi
