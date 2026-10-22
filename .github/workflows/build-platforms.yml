@@ -62,7 +62,7 @@ jobs:
 
       - name: Run cache unit tests
         if: matrix.run_tests
-        run: meson test -C build cache --print-errorlogs -v
+        run: meson test -C build --suite unit --print-errorlogs -v
 
       - name: Setup SSH
         if: matrix.run_tests

@@ -84,7 +84,7 @@ jobs:
           if-no-files-found: ignore
 
       - name: Run cache unit tests
-        run: meson test -C build cache --print-errorlogs -v
+        run: meson test -C build --suite unit --print-errorlogs -v
 
       - name: Run tests
         timeout-minutes: 20

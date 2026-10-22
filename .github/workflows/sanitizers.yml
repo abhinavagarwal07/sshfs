@@ -79,7 +79,7 @@ jobs:
           ASAN_SYMBOLIZER_PATH: /usr/bin/llvm-symbolizer
         run: |
           mkdir -p "$RUNNER_TEMP/sanitizer"
-          meson test -C build cache --print-errorlogs -v
+          meson test -C build --suite unit --print-errorlogs -v
 
       - name: Test
         env:
