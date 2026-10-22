@@ -220,6 +220,8 @@ struct conn {
 	int req_count;
 	int dir_count;
 	int file_count;
+	pid_t ssh_pid;
+	int ssh_pid_valid;
 };
 
 struct buffer {
@@ -1162,11 +1164,74 @@ static void replace_arg(char **argp, const char *newarg)
 	}
 }
 
+static void clear_startup_pid_tracking(struct conn *conn)
+{
+	conn->ssh_pid = 0;
+	conn->ssh_pid_valid = 0;
+}
+
+static int set_cloexec(int fd)
+{
+	int flags = fcntl(fd, F_GETFD);
+
+	if (flags == -1)
+		return -1;
+
+	return fcntl(fd, F_SETFD, flags | FD_CLOEXEC);
+}
+
+static int make_cloexec_pipe(int fds[2])
+{
+	if (pipe(fds) == -1)
+		return -1;
+
+	if (set_cloexec(fds[0]) == -1 || set_cloexec(fds[1]) == -1) {
+		close(fds[0]);
+		close(fds[1]);
+		return -1;
+	}
+
+	return 0;
+}
+
+static int read_all_retry(int fd, void *buf, size_t size)
+{
+	char *p = buf;
+
+	while (size) {
+		ssize_t res = read(fd, p, size);
+
+		if (res == -1 && errno == EINTR)
+			continue;
+		if (res <= 0)
+			return -1;
+		p += res;
+		size -= res;
+	}
+	return 0;
+}
+
+static pid_t waitpid_retry(pid_t pid, int *status, int options)
+{
+	pid_t res;
+
+	do {
+		res = waitpid(pid, status, options);
+	} while (res == -1 && errno == EINTR);
+
+	return res;
+}
+
 static int start_ssh(struct conn *conn)
 {
 	char *ptyname = NULL;
 	int sockpair[2];
+	int pidpipe[2];
 	int pid;
+
+	clear_startup_pid_tracking(conn);
+	pidpipe[0] = -1;
+	pidpipe[1] = -1;
 
 	if (sshfs.password_stdin) {
 
@@ -1179,8 +1244,15 @@ static int start_ssh(struct conn *conn)
 			return -1;
 	}
 
+	if (make_cloexec_pipe(pidpipe) == -1) {
+		perror("failed to create pid pipe");
+		return -1;
+	}
+
 	if (socketpair(AF_UNIX, SOCK_STREAM, 0, sockpair) == -1) {
 		perror("failed to create socket pair");
+		close(pidpipe[0]);
+		close(pidpipe[1]);
 		return -1;
 	}
 	conn->rfd = sockpair[0];
@@ -1190,10 +1262,13 @@ static int start_ssh(struct conn *conn)
 	if (pid == -1) {
 		perror("failed to fork");
 		close(sockpair[1]);
+		close(pidpipe[0]);
+		close(pidpipe[1]);
 		return -1;
 	} else if (pid == 0) {
 		int devnull;
 
+		close(pidpipe[0]);
 		devnull = open("/dev/null", O_WRONLY);
 
 		if (dup2(sockpair[1], 0) == -1 || dup2(sockpair[1], 1) == -1) {
@@ -1211,8 +1286,12 @@ static int start_ssh(struct conn *conn)
 		case -1:
 			perror("failed to fork");
 			_exit(1);
-		case 0:
+		case 0: {
+			pid_t me = getpid();
+			(void) write(pidpipe[1], &me, sizeof(me));
+			close(pidpipe[1]);
 			break;
+		}
 		default:
 			_exit(0);
 		}
@@ -1260,8 +1339,14 @@ static int start_ssh(struct conn *conn)
 			sshfs.ssh_args.argv[0], strerror(errno));
 		_exit(1);
 	}
-	waitpid(pid, NULL, 0);
+	if (waitpid_retry(pid, NULL, 0) == -1)
+		perror("waitpid");
 	close(sockpair[1]);
+	close(pidpipe[1]);
+	if (read_all_retry(pidpipe[0], &conn->ssh_pid,
+			   sizeof(conn->ssh_pid)) == 0)
+		conn->ssh_pid_valid = 1;
+	close(pidpipe[0]);
 	return 0;
 }
 
@@ -1638,6 +1723,22 @@ static void close_conn(struct conn *conn)
 	}
 }
 
+/*
+ * Close a connection whose start failed and stop the ssh behind it. That ssh
+ * was started with a double fork, so it is not our child and nobody waits for
+ * it; if it is stuck in connect(), authentication or a ProxyCommand it does
+ * not notice the closed socket and would keep running. The pid is only kept
+ * while a connection attempt is in progress, so a working connection is
+ * never signalled.
+ */
+static void cleanup_tracked_conn(struct conn *conn)
+{
+	close_conn(conn);
+	if (conn->ssh_pid_valid)
+		(void) kill(conn->ssh_pid, SIGTERM);
+	clear_startup_pid_tracking(conn);
+}
+
 static void *process_requests(void *data_)
 {
 	(void) data_;
@@ -1937,7 +2038,7 @@ static int connect_remote(struct conn *conn)
 		err = sftp_init(conn);
 
 	if (err)
-		close_conn(conn);
+		cleanup_tracked_conn(conn);
 	else
 		sshfs.num_connect++;
 
@@ -1958,6 +2059,7 @@ static int start_processing_thread(struct conn *conn)
 		err = connect_remote(conn);
 		if (err)
 			return -EIO;
+		clear_startup_pid_tracking(conn);
 	}
 
 	if (sshfs.detect_uid) {
@@ -4232,9 +4334,12 @@ static int ssh_connect(void)
 			return -1;
 
 		if (!sshfs.no_check_root &&
-		    sftp_check_root(&sshfs.conns[0], sshfs.base_path) != 0)
+		    sftp_check_root(&sshfs.conns[0], sshfs.base_path) != 0) {
+			cleanup_tracked_conn(&sshfs.conns[0]);
 			return -1;
+		}
 
+		clear_startup_pid_tracking(&sshfs.conns[0]);
 	}
 	return 0;
 }
