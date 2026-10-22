@@ -1,3 +1,23 @@
+Unreleased
+----------
+
+* Improved reconnect cleanup so interrupted startup and failed connection
+  attempts close local fds and terminate the tracked detached ssh helper
+  during the startup window.
+* Made stale file and directory handles fail locally after reconnect instead
+  of sending old SFTP handle strings to a new server session. This can make
+  open/opendir races fail with EIO where they previously returned a doomed
+  handle, and makes fstat on a stale open file fail even when
+  ``workaround=fstat`` is enabled.
+* Purged the directory cache on reconnect and prevented in-flight directory
+  and symlink lookups from publishing pre-reconnect data after the purge.
+  With multiple connections this conservatively clears the whole directory
+  cache when any connection reconnects.
+* Fixed reconnect-time request accounting for failed connections and send
+  failures after request registration.
+* Fixed cleanup leaks in async readdir error handling and early start_ssh()
+  error paths.
+
 Release 3.7.6 (2026-05-30)
 --------------------------
 
