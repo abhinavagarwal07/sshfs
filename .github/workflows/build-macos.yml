@@ -104,7 +104,7 @@ jobs:
         timeout-minutes: 2
         run: |
           cd build
-          python3 -m pytest test/test_hostname_validation.py --timeout=30 --junitxml=test-results.xml
+          python3 -m pytest test/test_hostname_validation.py test/test_macos_daemonize.py --timeout=60 --junitxml=test-results.xml
 
       - name: Check mount-free test results
         if: ${{ !cancelled() && steps.no_mount.outcome != 'skipped' }}
@@ -114,7 +114,10 @@ jobs:
           import xml.etree.ElementTree as ET
 
           cases = list(ET.parse('build/test-results.xml').getroot().iter('testcase'))
-          required = {'test_reject_option_injection_in_hostname', 'test_reject_dash_host_after_doubledash'}
+          required = {
+              'test_reject_option_injection_in_hostname', 'test_reject_dash_host_after_doubledash',
+              'test_shim_loads', 'test_no_mount_before_daemonize',
+          }
           missing = required - {case.get('name') for case in cases}
           bad = [case.get('name') for case in cases
                  if any(case.find(tag) is not None for tag in ('skipped', 'failure', 'error'))]
@@ -125,6 +128,9 @@ jobs:
           if missing or bad:
               raise SystemExit(f'::error::missing tests: {sorted(missing)}; skipped or failed: {bad}')
           PY
+
+      - name: Show sshfs signature
+        run: codesign -dv --verbose=4 build/sshfs
 
       - name: Smoke test
         run: |
