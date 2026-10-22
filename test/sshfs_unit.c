@@ -19,7 +19,6 @@ int sshfs_main(int argc, char *argv[]);
 #include "../sshfs.c"
 #undef main
 
-#include <sys/ioctl.h>
 #include <sys/resource.h>
 
 #define T_MAX_CONNS 2
@@ -538,27 +537,15 @@ static int t_test_waiting_sender_gives_up_after_reconnect(void)
 	return 0;
 }
 
-/*
- * Wait until a writer has stalled on a full socket: what the far end has
- * received stops growing, well short of the whole request.
- */
-static int t_wait_writer_stalled(int fd, size_t total)
+/* Wait until a writer has filled the socket, so that it is blocked in write */
+static int t_wait_socket_full(int fd)
 {
-	int last = -1;
-	int same = 0;
+	struct pollfd pfd = { .fd = fd, .events = POLLOUT };
 	int i;
 
 	for (i = 0; i < T_TIMEOUT_SECS * 1000; i++) {
-		int pending = 0;
-
-		if (ioctl(fd, FIONREAD, &pending) == -1)
-			return -1;
-		if ((size_t) pending >= total)
-			return -1;	/* everything fitted; nothing to wait for */
-		same = pending > 0 && pending == last ? same + 1 : 0;
-		if (same >= 50)
+		if (poll(&pfd, 1, 0) == 0)
 			return 0;
-		last = pending;
 		usleep(1000);
 	}
 	return -1;
@@ -579,6 +566,7 @@ static int t_test_blocked_writer_is_released(void)
 				   .expect = SSH_FXP_ATTRS };
 	static const uint8_t rubbish[8] = { 0xff, 0xff, 0xff, 0xff,
 					    0xff, 0xff, 0xff, 0xff };
+	int sndbuf = 4096;
 	pthread_t thread;
 
 	t_responder_init(&ra);
@@ -586,13 +574,14 @@ static int t_test_blocked_writer_is_released(void)
 		return t_fail("could not start the session");
 	job.connver = t_connver(conn);
 
-	/* Too big for the socket buffers, and the responder stops reading */
+	/* A small send buffer, and a request that cannot fit in it */
+	if (setsockopt(conn->wfd, SOL_SOCKET, SO_SNDBUF, &sndbuf,
+		       sizeof(sndbuf)) == -1)
+		return t_fail("setsockopt failed");
 	if (pthread_create(&thread, NULL, t_bound_thread, &job) != 0)
 		return t_fail("pthread_create failed");
-	if (t_wait_until(t_reqtab_size_is_one, NULL) == -1)
-		return t_fail("request was not queued");
-	if (t_wait_writer_stalled(ra.fd, job.pathlen) == -1)
-		return t_fail("writer did not stall on the full socket");
+	if (t_wait_socket_full(conn->wfd) == -1)
+		return t_fail("writer did not fill the socket");
 
 	if (t_write_full(ra.fd, rubbish, sizeof(rubbish)) == -1)
 		return t_fail("could not write to the connection");
