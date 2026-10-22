@@ -9,9 +9,10 @@
   backend runs after it has computed its reply and before it returns it.
 
   Output is one TAP-style line per case.  A case listed with an xfail reason
-  documents a known bug: it passes the run while the bug reproduces and fails
-  the run (XPASS) once it no longer does.  Only the assertions written with
-  XCHECK can be expected to fail; any other failed check is a plain failure.
+  documents a known gap in the cache: it passes the run while the gap is there
+  and fails the run (XPASS) once it is closed.  Only the assertions written
+  with XCHECK can be expected to fail; any other failed check is a plain
+  failure.
 */
 
 #include <errno.h>
@@ -119,12 +120,18 @@ static void check_failed(int line, const char *expr, int known)
 struct fent {
 	int used;
 	char path[PATH_LEN];
+	ino_t ino;		/* names with the same ino are hard links */
 	mode_t mode;
 	off_t size;
+	uid_t uid;
+	gid_t gid;
+	time_t atime;
+	time_t mtime;
 	char link[PATH_LEN];
 };
 
 static struct fent ents[MAX_ENT];
+static ino_t next_ino;
 
 static struct {
 	int init, getattr, readlink, opendir, readdir, releasedir;
@@ -134,7 +141,9 @@ static struct {
 
 static void (*hook_getattr)(void);	/* runs once, inside the next getattr */
 static void (*hook_readdir)(void);	/* runs once, inside the next readdir */
+static void (*hook_readlink)(void);	/* runs once, inside the next readlink */
 static int readdir_err;
+static int readdir_fail_at;		/* fail with EIO before this entry */
 static int readdir_no_attrs;
 static off_t last_readdir_offset;
 static uint64_t last_readdir_fh;
@@ -179,6 +188,7 @@ static struct fent *ent_add(const char *path, mode_t mode, off_t size)
 	memset(e, 0, sizeof(*e));
 	e->used = 1;
 	g_strlcpy(e->path, path, sizeof(e->path));
+	e->ino = ++next_ino;
 	e->mode = mode;
 	e->size = size;
 	return e;
@@ -224,12 +234,47 @@ static int is_child(const char *dir, const char *path)
 	return *rest && !strchr(rest, '/');
 }
 
+static nlink_t count_names(ino_t ino)
+{
+	nlink_t n = 0;
+	int i;
+
+	for (i = 0; i < MAX_ENT; i++)
+		if (ents[i].used && ents[i].ino == ino)
+			n++;
+	return n;
+}
+
+/* hard links share one inode: copy its attributes to every other name */
+static void sync_inode(const struct fent *src)
+{
+	int i;
+
+	for (i = 0; i < MAX_ENT; i++) {
+		struct fent *o = &ents[i];
+
+		if (!o->used || o == src || o->ino != src->ino)
+			continue;
+		o->mode = src->mode;
+		o->size = src->size;
+		o->uid = src->uid;
+		o->gid = src->gid;
+		o->atime = src->atime;
+		o->mtime = src->mtime;
+	}
+}
+
 static void fill_stat(struct stat *st, const struct fent *e)
 {
 	memset(st, 0, sizeof(*st));
+	st->st_ino = e->ino;
 	st->st_mode = e->mode;
 	st->st_size = e->size;
-	st->st_nlink = 1;
+	st->st_uid = e->uid;
+	st->st_gid = e->gid;
+	st->st_atime = e->atime;
+	st->st_mtime = e->mtime;
+	st->st_nlink = count_names(e->ino);
 }
 
 static void run_hook(void (**hook)(void))
@@ -279,6 +324,8 @@ static int fake_readlink(const char *path, char *buf, size_t size)
 		n = size - 1;
 	memcpy(buf, e->link, n);
 	buf[n] = '\0';
+	/* the reply is computed; anything that happens now comes too late */
+	run_hook(&hook_readlink);
 	return 0;
 }
 
@@ -321,6 +368,8 @@ static int fake_readdir(const char *path, void *buf, fuse_fill_dir_t filler,
 	for (i = 0; i < n; i++) {
 		struct stat st;
 
+		if (i == readdir_fail_at)
+			return -EIO;
 		memset(&st, 0, sizeof(st));
 		if (!readdir_no_attrs)
 			fill_stat(&st, &snap[i]);
@@ -412,6 +461,7 @@ static int fake_rename(const char *from, const char *to, unsigned int flags)
 static int fake_link(const char *from, const char *to)
 {
 	const struct fent *e;
+	struct fent *l;
 
 	calls.link++;
 	e = ent_find(from);
@@ -419,7 +469,12 @@ static int fake_link(const char *from, const char *to)
 		return -ENOENT;
 	if (ent_find(to))
 		return -EEXIST;
-	ent_add(to, e->mode, e->size);
+	l = ent_add(to, e->mode, e->size);
+	l->ino = e->ino;
+	l->uid = e->uid;
+	l->gid = e->gid;
+	l->atime = e->atime;
+	l->mtime = e->mtime;
 	return 0;
 }
 
@@ -433,26 +488,42 @@ static int fake_chmod(const char *path, mode_t mode, struct fuse_file_info *fi)
 	if (!e)
 		return -ENOENT;
 	e->mode = (e->mode & S_IFMT) | (mode & 07777);
+	sync_inode(e);
 	return 0;
 }
 
 static int fake_chown(const char *path, uid_t uid, gid_t gid,
 		      struct fuse_file_info *fi)
 {
-	(void) uid;
-	(void) gid;
+	struct fent *e;
+
 	(void) fi;
 	calls.chown++;
-	return ent_find(path) ? 0 : -ENOENT;
+	e = ent_find(path);
+	if (!e)
+		return -ENOENT;
+	if (uid != (uid_t) -1)
+		e->uid = uid;
+	if (gid != (gid_t) -1)
+		e->gid = gid;
+	sync_inode(e);
+	return 0;
 }
 
 static int fake_utimens(const char *path, const struct timespec tv[2],
 			struct fuse_file_info *fi)
 {
-	(void) tv;
+	struct fent *e;
+
 	(void) fi;
 	calls.utimens++;
-	return ent_find(path) ? 0 : -ENOENT;
+	e = ent_find(path);
+	if (!e)
+		return -ENOENT;
+	e->atime = tv[0].tv_sec;
+	e->mtime = tv[1].tv_sec;
+	sync_inode(e);
+	return 0;
 }
 
 static int fake_truncate(const char *path, off_t size,
@@ -466,6 +537,7 @@ static int fake_truncate(const char *path, off_t size,
 	if (!e)
 		return -ENOENT;
 	e->size = size;
+	sync_inode(e);
 	return 0;
 }
 
@@ -482,6 +554,7 @@ static int fake_write(const char *path, const char *buf, size_t size,
 		return -ENOENT;
 	if (offset + (off_t) size > e->size)
 		e->size = offset + (off_t) size;
+	sync_inode(e);
 	return (int) size;
 }
 
@@ -540,8 +613,11 @@ static void reset_state(void)
 	memset(&calls, 0, sizeof(calls));
 	hook_getattr = NULL;
 	hook_readdir = NULL;
+	hook_readlink = NULL;
 	readdir_err = 0;
+	readdir_fail_at = -1;
 	readdir_no_attrs = 0;
+	next_ino = 100;
 	last_readdir_offset = -1;
 	last_readdir_fh = 0;
 	last_releasedir_fh = 0;
@@ -560,6 +636,9 @@ static void reset_state(void)
 struct listing {
 	int n;
 	char name[MAX_ENT][32];
+	mode_t mode[MAX_ENT];
+	off_t size[MAX_ENT];
+	ino_t ino[MAX_ENT];
 	off_t max_off;
 };
 
@@ -568,24 +647,32 @@ static int collect(void *buf, const char *name, const struct stat *st,
 {
 	struct listing *l = buf;
 
-	(void) st;
 	(void) flags;
-	if (l->n < MAX_ENT)
+	if (l->n < MAX_ENT) {
 		g_strlcpy(l->name[l->n], name, sizeof(l->name[0]));
+		l->mode[l->n] = st->st_mode;
+		l->size[l->n] = st->st_size;
+		l->ino[l->n] = st->st_ino;
+	}
 	l->n++;
 	if (off > l->max_off)
 		l->max_off = off;
 	return 0;
 }
 
-static int listing_has(const struct listing *l, const char *name)
+static int listing_index(const struct listing *l, const char *name)
 {
 	int i;
 
 	for (i = 0; i < l->n && i < MAX_ENT; i++)
 		if (strcmp(l->name[i], name) == 0)
-			return 1;
-	return 0;
+			return i;
+	return -1;
+}
+
+static int listing_has(const struct listing *l, const char *name)
+{
+	return listing_index(l, name) >= 0;
 }
 
 /* list a directory the way the kernel does: open, read, release */
@@ -871,6 +958,55 @@ static void test_invalidation_fresh_values(void)
 	CHECK(calls.getattr == 4);
 }
 
+static void test_metadata_after_ops(void)
+{
+	struct stat st, st2;
+	struct timespec tv[2];
+
+	mk_file("/f", 10);
+	REQUIRE(do_getattr("/f", &st) == 0);
+	CHECK(st.st_uid == 0);
+	CHECK(st.st_gid == 0);
+	CHECK(st.st_nlink == 1);
+
+	REQUIRE(ops->chown("/f", 1000, 2000, NULL) == 0);
+	REQUIRE(do_getattr("/f", &st) == 0);
+	CHECK(st.st_uid == 1000);
+	CHECK(st.st_gid == 2000);
+	CHECK(calls.getattr == 2);
+	REQUIRE(do_getattr("/f", &st) == 0);
+	CHECK(st.st_uid == 1000);
+	CHECK(calls.getattr == 2);
+
+	memset(tv, 0, sizeof(tv));
+	tv[0].tv_sec = 111;
+	tv[1].tv_sec = 222;
+	REQUIRE(ops->utimens("/f", tv, NULL) == 0);
+	REQUIRE(do_getattr("/f", &st) == 0);
+	CHECK(st.st_atime == 111);
+	CHECK(st.st_mtime == 222);
+	CHECK(st.st_uid == 1000);
+	CHECK(calls.getattr == 3);
+	REQUIRE(do_getattr("/f", &st) == 0);
+	CHECK(st.st_mtime == 222);
+	CHECK(calls.getattr == 3);
+
+	/* a second name for the same inode */
+	REQUIRE(ops->link("/f", "/l") == 0);
+	REQUIRE(do_getattr("/f", &st) == 0);
+	REQUIRE(do_getattr("/l", &st2) == 0);
+	CHECK(st.st_nlink == 2);
+	CHECK(st2.st_nlink == 2);
+	CHECK(st.st_ino == st2.st_ino);
+	CHECK(st2.st_uid == 1000);
+	CHECK(st2.st_mtime == 222);
+	CHECK(calls.getattr == 5);
+	REQUIRE(do_getattr("/f", &st) == 0);
+	REQUIRE(do_getattr("/l", &st2) == 0);
+	CHECK(st.st_nlink == 2);
+	CHECK(calls.getattr == 5);
+}
+
 static void test_cache_invalidate(void)
 {
 	mk_file("/f", 1);
@@ -1135,6 +1271,41 @@ static void test_readdir_error_not_cached(void)
 	CHECK(calls.readdir == 2);
 }
 
+static void test_readdir_partial_error(void)
+{
+	struct listing l;
+
+	mk_dir("/d");
+	mk_file("/d/a", 1);
+	mk_file("/d/b", 2);
+	mk_file("/d/c", 3);
+
+	/* the backend delivers "a" and then fails */
+	readdir_fail_at = 1;
+	CHECK(do_readdir("/d", 0, &l) == -EIO);
+	CHECK(l.n == 1);
+	readdir_fail_at = -1;
+
+	/* the incomplete listing is not cached */
+	CHECK(cache_lookup("/d") == NULL);
+
+	/*
+	 * "a" came with a valid reply and passed the write counter check
+	 * before the error, so its attributes stay cached, as they would
+	 * after a getattr.  "b" was never delivered.
+	 */
+	CHECK(cache_lookup("/d/a") != NULL);
+	CHECK(cache_lookup("/d/b") == NULL);
+	CHECK(!probe("/d/a"));
+	CHECK(probe("/d/b"));
+
+	/* the next listing goes to the backend and is complete */
+	REQUIRE(do_readdir("/d", 0, &l) == 0);
+	CHECK(l.n == 3);
+	CHECK(calls.readdir == 2);
+	CHECK(!probe_dir("/d"));
+}
+
 static void test_readdir_handle_reuse(void)
 {
 	struct fuse_file_info fi;
@@ -1352,10 +1523,14 @@ static void test_write_guard_readdir(void)
 {
 	struct listing l;
 	struct stat st;
+	ino_t ino_a, ino_b;
+	int a, b;
 
 	mk_dir("/d");
 	mk_file("/d/a", 1);
 	mk_file("/d/b", 2);
+	ino_a = ent_get("/d/a")->ino;
+	ino_b = ent_get("/d/b")->ino;
 	hook_readdir = hook_write_da;
 
 	REQUIRE(do_readdir("/d", 0, &l) == 0);
@@ -1366,6 +1541,26 @@ static void test_write_guard_readdir(void)
 	CHECK(cache_lookup("/d/b") == NULL);
 	REQUIRE(do_getattr("/d/a", &st) == 0);
 	CHECK(st.st_size == 105);
+
+	/*
+	 * The listing itself is cached with the stat of each entry as it was
+	 * when the backend read the directory.  libfuse uses only the type and
+	 * the inode number of those, and they are right.  The size of "a" is
+	 * the one from before the write; it is pinned here so that a change in
+	 * how the cache treats these stats gets noticed.
+	 */
+	REQUIRE(do_readdir("/d", 0, &l) == 0);
+	CHECK(calls.readdir == 1);
+	CHECK(l.n == 2);
+	a = listing_index(&l, "a");
+	b = listing_index(&l, "b");
+	REQUIRE(a >= 0 && b >= 0);
+	CHECK(S_ISREG(l.mode[a]));
+	CHECK(l.ino[a] == ino_a);
+	CHECK(l.size[a] == 1);
+	CHECK(S_ISREG(l.mode[b]));
+	CHECK(l.ino[b] == ino_b);
+	CHECK(l.size[b] == 2);
 }
 
 /* ---- calls in flight across operations that do not bump write_ctr ---- */
@@ -1385,11 +1580,24 @@ static void hook_chmod_da(void)
 	(void) ops->chmod("/d/a", 0600, NULL);
 }
 
+static void hook_replace_link(void)
+{
+	(void) ops->unlink("/l");
+	(void) ops->symlink("target-B", "/l");
+}
+
 /*
- * Only cache_write() advances write_ctr.  The other modifying operations
- * just purge, so a lookup that started before one of them can still install
- * what it read afterwards, and the stale value is then served until its
- * timeout.
+ * A reply that is in flight when a modifying operation purges its path is
+ * installed after the purge, and then served until its timeout.  Only
+ * cache_write() advances write_ctr, and cache_add_dir() and cache_add_link()
+ * do not check it at all.
+ *
+ * These are gaps in the cache layer, shown by running the two calls in an
+ * order the cache cannot rule out.  Whether a mount can produce that order
+ * differs: readdir and mkdir in one directory are serialised by the VFS
+ * locks, so that pair is probably out of reach there, while a getattr or a
+ * readdir racing a chmod of an entry is plausibly reachable, with a window of
+ * about one round trip.  None of this has been reproduced on a mount.
  */
 static void test_race_readdir_mkdir(void)
 {
@@ -1437,6 +1645,21 @@ static void test_race_readdir_chmod(void)
 
 	REQUIRE(do_getattr("/d/a", &st) == 0);
 	XCHECK((st.st_mode & 07777) == 0600);
+}
+
+static void test_race_readlink(void)
+{
+	char buf[64];
+
+	mk_link("/l", "target-A");
+	hook_readlink = hook_replace_link;
+
+	REQUIRE(ops->readlink("/l", buf, sizeof(buf)) == 0);
+	CHECK(strcmp(buf, "target-A") == 0);	/* the reply in flight */
+	REQUIRE(strcmp(ent_get("/l")->link, "target-B") == 0);
+
+	REQUIRE(ops->readlink("/l", buf, sizeof(buf)) == 0);
+	XCHECK(strcmp(buf, "target-B") == 0);
 }
 
 /* ---- cleaning ---- */
@@ -1669,6 +1892,8 @@ static const struct tcase cases[] = {
 	  test_invalidation, NULL },
 	{ "invalidate: next getattr returns the new value",
 	  test_invalidation_fresh_values, NULL },
+	{ "invalidate: next getattr returns the new owner, times and links",
+	  test_metadata_after_ops, NULL },
 	{ "invalidate: cache_invalidate drops one path",
 	  test_cache_invalidate, NULL },
 	{ "rename: children of the old name are dropped",
@@ -1686,6 +1911,8 @@ static const struct tcase cases[] = {
 	  test_readdir_without_attrs, NULL },
 	{ "readdir: errors are not cached", test_readdir_error_not_cached,
 	  NULL },
+	{ "readdir: an error after some entries caches no listing",
+	  test_readdir_partial_error, NULL },
 	{ "readdir: backend handle is opened once per handle",
 	  test_readdir_handle_reuse, NULL },
 	{ "readdir: listing and attrs of a dir are separate",
@@ -1703,15 +1930,18 @@ static const struct tcase cases[] = {
 	  test_write_guard_api, NULL },
 	{ "write counter: readdir in flight across a write drops child attrs",
 	  test_write_guard_readdir, NULL },
-	{ "race: readdir in flight across mkdir caches a stale listing",
+	{ "stale install: readdir in flight across mkdir (cache layer only)",
 	  test_race_readdir_mkdir,
-	  "only write bumps write_ctr; mkdir purges before cache_add_dir" },
-	{ "race: getattr in flight across chmod caches the old mode",
+	  "cache_add_dir has no generation check; the VFS serialises this pair on a mount" },
+	{ "stale install: getattr in flight across chmod",
 	  test_race_getattr_chmod,
 	  "only write bumps write_ctr; chmod purges before cache_add_attr" },
-	{ "race: readdir in flight across chmod caches the old child mode",
+	{ "stale install: readdir in flight across chmod of an entry",
 	  test_race_readdir_chmod,
 	  "only write bumps write_ctr; chmod purges before cache_dirfill" },
+	{ "stale install: readlink in flight across a symlink replacement",
+	  test_race_readlink,
+	  "cache_add_link has no generation check; unlink+symlink purge before it" },
 	{ "clean: expired entries go after clean_interval",
 	  test_clean_interval, NULL },
 	{ "clean: expired entries go when over max_size",
