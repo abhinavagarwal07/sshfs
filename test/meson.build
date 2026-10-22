@@ -3,6 +3,7 @@ test_scripts = [ 'conftest.py', 'pytest.ini', 'test_sshfs.py',
                  'test_mount_options.py',
                  'test_data_integrity.py',
                  'test_workloads.py',
+                 'test_errors.py',
                  'util.py' ]
 custom_target('test_scripts', input: test_scripts,
               output: test_scripts, build_by_default: true,
