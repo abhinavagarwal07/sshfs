@@ -23,6 +23,7 @@ from util import (
     base_cmdline,
     basename,
     fuse_test_marker,
+    require_fuse,
     safe_sleep,
     os_create,
     os_open,
@@ -804,12 +805,55 @@ def _mount_sshfs(tmpdir, extra_opts=None):
     return mount_process, mnt_dir, src_dir
 
 
+def test_chown_group(tmpdir, capfd):
+    capfd.register_output(r"^Warning: Permanently added 'localhost' .+", count=0)
+
+    # The owner of a file may chgrp it to any group they are a member of.
+    # Without a second group there is nothing to test; CI must not lose the
+    # test that way, so it fails there.
+    groups = [g for g in os.getgroups() if g != os.getgid()]
+    if os.getuid() == 0 and not groups:
+        groups = [os.getgid() + 1]
+    if not groups:
+        reason = "user has no supplementary group to chgrp to"
+        if require_fuse():
+            pytest.fail(reason)
+        pytest.skip(reason)
+
+    mount_process, mnt_dir, src_dir = _mount_sshfs(tmpdir, [])
+    try:
+        name = name_generator()
+        filename = pjoin(mnt_dir, name)
+        os.mkdir(filename)
+        fstat = os.lstat(filename)
+        gid_new = [g for g in groups if g != fstat.st_gid][0]
+
+        os.chown(filename, -1, gid_new)
+        for path in (filename, pjoin(src_dir, name)):
+            nstat = os.lstat(path)
+            assert nstat.st_gid == gid_new
+            assert nstat.st_uid == fstat.st_uid
+
+        # chown to the current owner changes nothing
+        os.chown(filename, fstat.st_uid, -1)
+        nstat = os.lstat(filename)
+        assert nstat.st_gid == gid_new
+        assert nstat.st_uid == fstat.st_uid
+    except Exception:
+        cleanup(mount_process, mnt_dir)
+        raise
+    else:
+        umount(mount_process, mnt_dir)
+
+
 def test_disable_hardlink(tmpdir, capfd):
     capfd.register_output(r"^Warning: Permanently added 'localhost' .+", count=0)
 
     # Control: verify hardlinks work without disable_hardlink.
-    # If the server lacks the extension, skip this test entirely.
+    # If the server lacks the extension, skip this test entirely. Any other
+    # failure of os.link() is a real error.
     mount_process, mnt_dir, src_dir = _mount_sshfs(tmpdir, [])
+    unsupported = False
     try:
         name1 = pjoin(mnt_dir, name_generator())
         name2 = pjoin(mnt_dir, name_generator())
@@ -817,16 +861,21 @@ def test_disable_hardlink(tmpdir, capfd):
             fh.write(b"test")
         try:
             os.link(name1, name2)
-        except OSError:
+        except OSError as exc:
             os.unlink(name1)
-            pytest.skip("server does not support hardlink extension")
-        os.unlink(name2)
-        os.unlink(name1)
+            if exc.errno not in (errno.ENOSYS, errno.EOPNOTSUPP):
+                raise
+            unsupported = True
+        else:
+            os.unlink(name2)
+            os.unlink(name1)
     except Exception:
         cleanup(mount_process, mnt_dir)
         raise
     else:
         umount(mount_process, mnt_dir)
+    if unsupported:
+        pytest.skip("server does not support hardlink extension")
 
     # Now test with disable_hardlink — links should fail
     mount_process, mnt_dir, src_dir = _mount_sshfs(tmpdir, ["disable_hardlink"])

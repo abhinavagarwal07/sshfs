@@ -85,6 +85,8 @@ jobs:
 
       - name: Run tests
         timeout-minutes: 20
+        env:
+          SSHFS_TEST_REQUIRE_FUSE: 1
         run: |
           cd build
           python3 -m pytest --maxfail=99 --timeout=300 --junitxml=test-results.xml test/
