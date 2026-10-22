@@ -8,7 +8,9 @@ if __name__ == "__main__":
     sys.exit(pytest.main([__file__] + sys.argv[1:]))
 
 import os
+import shlex
 import subprocess
+import sys
 from contextlib import contextmanager
 from os.path import join as pjoin
 from util import (
@@ -34,7 +36,7 @@ def sshfs_mounted(src_dir, mnt_dir, opts):
         f"localhost:{src_dir}",
         mnt_dir,
         "-o",
-        "StrictHostKeyChecking=no",
+        "StrictHostKeyChecking=no,BatchMode=yes",
     ]
     for opt in opts:
         cmdline += ["-o", opt]
@@ -44,11 +46,19 @@ def sshfs_mounted(src_dir, mnt_dir, opts):
     try:
         wait_for_mount(mount_process, mnt_dir)
         yield
-    except Exception:
+    except BaseException:
         cleanup(mount_process, mnt_dir)
         raise
     else:
         umount(mount_process, mnt_dir)
+
+
+def captured_stderr(capfd):
+    """Return what the mount wrote to stderr, and put it back for conftest's check."""
+    captured = capfd.readouterr()
+    sys.stdout.write(captured.out)
+    sys.stderr.write(captured.err)
+    return captured.err
 
 
 def test_obsolete_libfuse2_options(tmpdir, capfd):
@@ -69,7 +79,7 @@ def test_obsolete_libfuse2_options(tmpdir, capfd):
         with open(pjoin(mnt_dir, "remote"), "rb") as fh:
             assert fh.read() == b"served by the mount"
 
-    err = capfd.readouterr().err
+    err = captured_stderr(capfd)
     for name in ("nonempty", "big_writes", "large_read"):
         assert f"option '{name}' is obsolete and ignored" in err
 
@@ -86,7 +96,7 @@ def test_fstab_nofail(tmpdir, capfd):
     with sshfs_mounted(src_dir, mnt_dir, ["nofail,_netdev"]):
         assert os.listdir(mnt_dir) == ["remote"]
 
-    assert "nofail" not in capfd.readouterr().err
+    assert "nofail" not in captured_stderr(capfd)
 
 
 def test_ssh_accepted_algorithms_options(tmpdir, capfd):
@@ -98,12 +108,21 @@ def test_ssh_accepted_algorithms_options(tmpdir, capfd):
     with open(pjoin(src_dir, "remote"), "wb") as fh:
         fh.write(b"served by the mount")
 
-    # stand-in for ssh that records what sshfs asked for
+    # Stand-in for ssh that records what sshfs asked for. It does not hand
+    # the two options on, so the test does not depend on the OpenSSH version.
     arg_log = str(tmpdir.join("ssh-args"))
     wrapper = str(tmpdir.join("ssh-wrapper"))
     with open(wrapper, "w") as fh:
         fh.write("#!/bin/sh\n")
-        fh.write(f"printf '%s\\n' \"$@\" > '{arg_log}'\n")
+        fh.write(f"printf '%s\\n' \"$@\" > {shlex.quote(arg_log)}\n")
+        fh.write('for arg in "$@"; do\n')
+        fh.write("    shift\n")
+        fh.write("    case $arg in\n")
+        fh.write("    -oPubkeyAcceptedAlgorithms=*) ;;\n")
+        fh.write("    -oHostbasedAcceptedAlgorithms=*) ;;\n")
+        fh.write('    *) set -- "$@" "$arg" ;;\n')
+        fh.write("    esac\n")
+        fh.write("done\n")
         fh.write('exec ssh "$@"\n')
     os.chmod(wrapper, 0o755)
 
