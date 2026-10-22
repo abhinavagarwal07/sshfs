@@ -99,7 +99,8 @@ jobs:
             exit 1
           fi
 
-      # A missing FUSE prerequisite makes the mount tests skip, not fail.
+      # SSHFS_TEST_REQUIRE_FUSE makes a missing FUSE prerequisite fail; this
+      # catches any other skipped test.
       - name: Check no tests were skipped
         run: |
           python3 - build/test-results.xml <<'EOF'

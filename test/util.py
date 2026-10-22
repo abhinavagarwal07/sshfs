@@ -128,8 +128,9 @@ def fuse_test_marker():
     """Return a pytest.marker that indicates FUSE availability
 
     If system/user/environment does not support FUSE, return
-    a `pytest.mark.skip` object with more details. If FUSE is
-    supported, return `pytest.mark.uses_fuse()`.
+    a `pytest.mark.skip` object with more details, or fail if
+    require_fuse() is true. If FUSE is supported, return
+    `pytest.mark.uses_fuse()`.
     """
 
     def skip(reason: str):

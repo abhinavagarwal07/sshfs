@@ -810,12 +810,13 @@ def test_chown_group(tmpdir, capfd):
 
     # The owner of a file may chgrp it to any group they are a member of.
     # Without a second group there is nothing to test; CI must not lose the
-    # test that way, so it fails there.
-    groups = [g for g in os.getgroups() if g != os.getgid()]
-    if os.getuid() == 0 and not groups:
-        groups = [os.getgid() + 1]
-    if not groups:
-        reason = "user has no supplementary group to chgrp to"
+    # test that way, so it fails there. The new directory may inherit any of
+    # the groups (setgid parent), so pick the target after creating it.
+    groups = list(dict.fromkeys([os.getgid(), *os.getgroups()]))
+    if os.getuid() == 0 and len(groups) < 2:
+        groups.append(os.getgid() + 1)
+    if len(groups) < 2:
+        reason = "user has no second group to chgrp to"
         if require_fuse():
             pytest.fail(reason)
         pytest.skip(reason)
