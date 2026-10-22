@@ -80,3 +80,18 @@ def test_obsolete_libfuse2_options(tmpdir, capfd):
     err = captured_stderr(capfd)
     for name in ("nonempty", "big_writes", "large_read"):
         assert f"option '{name}' is obsolete and ignored" in err
+
+
+def test_fstab_nofail(tmpdir, capfd):
+    """mount(8) hands nofail to the helper; it means nothing to sshfs."""
+
+    capfd.register_output(KNOWN_HOSTS_NOISE, count=0)
+    mnt_dir = str(tmpdir.mkdir("mnt"))
+    src_dir = str(tmpdir.mkdir("src"))
+    with open(pjoin(src_dir, "remote"), "wb") as fh:
+        fh.write(b"served by the mount")
+
+    with sshfs_mounted(src_dir, mnt_dir, ["nofail,_netdev"]):
+        assert os.listdir(mnt_dir) == ["remote"]
+
+    assert "nofail" not in captured_stderr(capfd)

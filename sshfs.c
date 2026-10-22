@@ -562,6 +562,7 @@ static struct fuse_opt sshfs_opts[] = {
 	FUSE_OPT_KEY("nouser", FUSE_OPT_KEY_DISCARD),
 	FUSE_OPT_KEY("users", FUSE_OPT_KEY_DISCARD),
 	FUSE_OPT_KEY("_netdev", FUSE_OPT_KEY_DISCARD),
+	FUSE_OPT_KEY("nofail", FUSE_OPT_KEY_DISCARD),
 
 	FUSE_OPT_END
 };

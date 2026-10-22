@@ -337,7 +337,9 @@ Mounting from /etc/fstab
 
 To mount an SSHFS filesystem from ``/etc/fstab``, simply use ``sshfs``
 as the file system type. (For backwards compatibility, you may also
-use ``fuse.sshfs``).
+use ``fuse.sshfs``). Options meant for mount(8) and systemd (``auto``,
+``noauto``, ``user``, ``nouser``, ``users``, ``nofail`` and ``_netdev``)
+are accepted and ignored.
 
 
 See also
