@@ -46,11 +46,10 @@ def sshfs_mounted(src_dir, mnt_dir, opts):
     try:
         wait_for_mount(mount_process, mnt_dir)
         yield
+        umount(mount_process, mnt_dir)
     except BaseException:
         cleanup(mount_process, mnt_dir)
         raise
-    else:
-        umount(mount_process, mnt_dir)
 
 
 def captured_stderr(capfd):
