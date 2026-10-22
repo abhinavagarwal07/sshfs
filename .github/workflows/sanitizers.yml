@@ -66,13 +66,10 @@ jobs:
           meson setup build -Db_sanitize=${{ matrix.san_flag }} -Db_lundef=false -Dwerror=true
           ninja -C build
 
-      - name: Create sanitizer log directory
-        run: mkdir -p sanitizer-logs
-
       - name: Test
         env:
-          ASAN_OPTIONS: "${{ matrix.sanitizer == 'asan' && format('{0}:log_path={1}/sanitizer-logs/asan', matrix.san_opts, github.workspace) || '' }}"
-          UBSAN_OPTIONS: "${{ matrix.sanitizer == 'ubsan' && format('{0}:log_path={1}/sanitizer-logs/ubsan', matrix.san_opts, github.workspace) || '' }}"
+          ASAN_OPTIONS: "${{ matrix.sanitizer == 'asan' && matrix.san_opts || '' }}"
+          UBSAN_OPTIONS: "${{ matrix.sanitizer == 'ubsan' && matrix.san_opts || '' }}"
           ASAN_SYMBOLIZER_PATH: /usr/bin/llvm-symbolizer
         run: |
           cd build
@@ -87,13 +84,11 @@ jobs:
           path: |
             build/test-results.xml
             build/meson-logs/
-            sanitizer-logs/
 
   asan-lsan:
     name: ASan + LeakSanitizer
     runs-on: ubuntu-24.04
     timeout-minutes: 30
-    continue-on-error: true
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -131,12 +126,9 @@ jobs:
           meson setup build -Db_sanitize=address -Db_lundef=false -Dwerror=true
           ninja -C build
 
-      - name: Create sanitizer log directory
-        run: mkdir -p sanitizer-logs
-
       - name: Test
         env:
-          ASAN_OPTIONS: "detect_leaks=1:halt_on_error=1:symbolize=1:log_path=${{ github.workspace }}/sanitizer-logs/asan-lsan"
+          ASAN_OPTIONS: "detect_leaks=1:halt_on_error=1:symbolize=1"
           LSAN_OPTIONS: "suppressions=${{ github.workspace }}/test/lsan_suppress.txt"
           ASAN_SYMBOLIZER_PATH: /usr/bin/llvm-symbolizer
         run: |
@@ -152,4 +144,3 @@ jobs:
           path: |
             build/test-results.xml
             build/meson-logs/
-            sanitizer-logs/
