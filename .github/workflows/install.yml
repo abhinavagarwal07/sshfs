@@ -1,0 +1,113 @@
+name: man page and install
+on:
+  push:
+    branches: [master]
+
+  pull_request:
+
+  workflow_dispatch:
+    inputs:
+      git-ref:
+        description: Git ref to test, e.g. refs/pull/123/merge (optional)
+        required: false
+
+permissions:
+  contents: read
+
+# nothing here needs to save a cache, and dispatch runs may build other refs
+cache-mode: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || (github.event_name == 'workflow_dispatch' && format('dispatch-{0}', inputs.git-ref || github.ref)) || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  man-and-install:
+    name: man page / install
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.git-ref }}
+          persist-credentials: false
+
+      - name: Show tested commit
+        run: |
+          git rev-parse HEAD
+          git cat-file -p HEAD | grep '^parent ' || true
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.12'
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc ninja-build pkg-config libglib2.0-dev libfuse3-dev
+
+      # meson.build only builds the man page when rst2man is found
+      - name: Install meson and docutils
+        run: pip3 install meson==1.12.1 docutils==0.23
+
+      - name: Build
+        run: |
+          meson setup build --prefix=/usr -Dwerror=true
+          ninja -C build
+
+      # docutils only stops at severe errors by default, so also run it
+      # with --halt=warning
+      - name: Check the man page
+        shell: bash
+        run: |
+          rst2man=$(command -v rst2man || command -v rst2man.py)
+          "$rst2man" --halt=warning sshfs.rst "$RUNNER_TEMP/checked-sshfs.1"
+          test -f build/sshfs.1
+          test -s build/sshfs.1
+          grep -Eq '^\.TH[[:space:]]' build/sshfs.1
+
+      - name: Install into a staging directory
+        run: DESTDIR="$RUNNER_TEMP/inst" meson install -C build
+
+      # Plain "meson dist" runs the tests, and wrong_cmd fails by design
+      - name: Make a meson dist tarball, build it and install it
+        run: |
+          meson dist -C build --no-tests
+          mkdir "$RUNNER_TEMP/dist"
+          tar -xf build/meson-dist/sshfs-*.tar.xz -C "$RUNNER_TEMP/dist"
+          cd "$RUNNER_TEMP"/dist/sshfs-*
+          test -f sshfs.rst
+          test -f utils/install_helper.sh
+          test -f test/test_sshfs.py
+          meson setup build --prefix=/usr -Dwerror=true
+          ninja -C build
+          DESTDIR="$RUNNER_TEMP/inst-dist" meson install -C build
+
+      # utils/install_helper.sh makes mount.sshfs and mount.fuse.sshfs with
+      # GNU ln --relative, they have to point at the installed sshfs and must
+      # not contain the staging path
+      - name: Check the installed files
+        shell: bash
+        run: |
+          check() {  # staging directory, build directory it was installed from
+            cd "$1"
+            find . \( -type f -o -type l \) -print | sort
+            test ! -L usr/bin/sshfs
+            test -f usr/bin/sshfs
+            test -s usr/bin/sshfs
+            test -x usr/bin/sshfs
+            test ! -L usr/share/man/man1/sshfs.1
+            test -f usr/share/man/man1/sshfs.1
+            test -s "$2/sshfs.1"
+            grep -Eq '^\.TH[[:space:]]' "$2/sshfs.1"
+            cmp "$2/sshfs.1" usr/share/man/man1/sshfs.1
+            for name in mount.sshfs mount.fuse.sshfs; do
+              test -L "usr/sbin/$name"
+              test "$(readlink "usr/sbin/$name")" = ../bin/sshfs
+              test "$(readlink -f "usr/sbin/$name")" = "$(readlink -f usr/bin/sshfs)"
+            done
+          }
+          check "$RUNNER_TEMP/inst" "$GITHUB_WORKSPACE/build"
+          check "$RUNNER_TEMP/inst-dist" "$(echo "$RUNNER_TEMP"/dist/sshfs-*)/build"
