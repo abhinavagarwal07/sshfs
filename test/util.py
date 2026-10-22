@@ -150,12 +150,16 @@ def _check_ssh_localhost():
 _mount_ctr = [0]
 
 
-def _mount_sshfs(tmpdir, extra_opts=None):
-    """Helper to mount sshfs with custom options. Returns (mount_process, mnt_dir, src_dir)."""
+def _mount_sshfs(tmpdir, extra_opts=None, src_dir=None):
+    """Helper to mount sshfs with custom options. Returns (mount_process, mnt_dir, src_dir).
+
+    The remote directory is a fresh one under tmpdir unless src_dir is given.
+    """
     _check_ssh_localhost()
     _mount_ctr[0] += 1
     mnt_dir = str(tmpdir.mkdir(f"mnt{_mount_ctr[0]}"))
-    src_dir = str(tmpdir.mkdir(f"src{_mount_ctr[0]}"))
+    if src_dir is None:
+        src_dir = str(tmpdir.mkdir(f"src{_mount_ctr[0]}"))
 
     cmdline = base_cmdline + [
         pjoin(basename, "sshfs"),
@@ -179,3 +183,20 @@ def _mount_sshfs(tmpdir, extra_opts=None):
         cleanup(mount_process, mnt_dir)
         raise
     return mount_process, mnt_dir, src_dir
+
+
+@contextmanager
+def mounted(tmpdir, extra_opts=None, src_dir=None):
+    """Mount sshfs, yield (mnt_dir, src_dir) and unmount again afterwards.
+
+    If the body fails (or skips) the mount is torn down with cleanup(), so a
+    failing test doesn't leave an sshfs process behind.
+    """
+    mount_process, mnt_dir, src_dir = _mount_sshfs(tmpdir, extra_opts, src_dir)
+    try:
+        yield mnt_dir, src_dir
+    except BaseException:
+        cleanup(mount_process, mnt_dir)
+        raise
+    else:
+        umount(mount_process, mnt_dir)
