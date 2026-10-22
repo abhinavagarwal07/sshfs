@@ -28,7 +28,8 @@ concurrency:
 jobs:
   # Pin a dispatched ref to one commit, so every job tests the same thing even
   # if refs/pull/N/merge moves while the run is going. git-ref is a full ref
-  # name or a commit SHA.
+  # name or a commit SHA; resolving the SHA once and passing that to every
+  # workflow keeps them on the same commit too.
   resolve:
     name: resolve ref
     if: github.event_name == 'workflow_dispatch' && inputs.git-ref != ''
@@ -41,10 +42,22 @@ jobs:
         env:
           GIT_REF: ${{ inputs.git-ref }}
         run: |
+          set -euo pipefail
           if [[ "$GIT_REF" =~ ^[0-9a-f]{40}$ ]]; then
             sha=$GIT_REF
           else
-            sha=$(git ls-remote "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY" "$GIT_REF" | awk 'NR == 1 { print $1 }')
+            if [[ "$GIT_REF" != refs/* ]] || ! git check-ref-format "$GIT_REF"; then
+              echo "git-ref has to be a full ref name or a 40-hex commit SHA" >&2
+              exit 1
+            fi
+            # ls-remote takes a pattern, so pick the exact ref (and, for an
+            # annotated tag, the commit it points to)
+            refs=$(git ls-remote --exit-code "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY" \
+                     "$GIT_REF" "$GIT_REF^{}")
+            sha=$(printf '%s\n' "$refs" | awk -v want="$GIT_REF" '
+              $2 == want { direct = $1; n++ }
+              $2 == want "^{}" { peeled = $1; p++ }
+              END { if (n != 1 || p > 1) exit 1; print p ? peeled : direct }')
           fi
           if ! [[ "$sha" =~ ^[0-9a-f]{40}$ ]]; then
             echo "can't resolve $GIT_REF" >&2
