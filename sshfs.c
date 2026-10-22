@@ -1549,6 +1549,39 @@ static int clean_req(void *key, struct request *req, gpointer user_data)
 	return TRUE;
 }
 
+/* Called with sshfs.lock held, once for every request that was counted */
+static void subtract_outstanding_locked(size_t len)
+{
+	int was_over = sshfs.outstanding_len > sshfs.max_outstanding_len;
+
+	if (len > sshfs.outstanding_len)
+		sshfs.outstanding_len = 0;
+	else
+		sshfs.outstanding_len -= len;
+
+	if (was_over && sshfs.outstanding_len <= sshfs.max_outstanding_len)
+		pthread_cond_broadcast(&sshfs.outstanding_cond);
+}
+
+struct clean_req_ctx {
+	struct conn *conn;
+	size_t removed_len;
+};
+
+static int clean_req_counting(void *key, struct request *req,
+			      gpointer user_data)
+{
+	struct clean_req_ctx *ctx = (struct clean_req_ctx *) user_data;
+	size_t len = req->len;
+
+	if (!clean_req(key, req, ctx->conn))
+		return FALSE;
+
+	/* req may be gone now */
+	ctx->removed_len += len;
+	return TRUE;
+}
+
 static int process_one_request(struct conn *conn)
 {
 	int res;
@@ -1574,14 +1607,7 @@ static int process_one_request(struct conn *conn)
 	if (req == NULL)
 		fprintf(stderr, "request %i not found\n", id);
 	else {
-		int was_over;
-
-		was_over = sshfs.outstanding_len > sshfs.max_outstanding_len;
-		sshfs.outstanding_len -= req->len;
-		if (was_over &&
-		    sshfs.outstanding_len <= sshfs.max_outstanding_len) {
-			pthread_cond_broadcast(&sshfs.outstanding_cond);
-		}
+		subtract_outstanding_locked(req->len);
 		g_hash_table_remove(sshfs.reqtab, GUINT_TO_POINTER(id));
 	}
 	pthread_mutex_unlock(&sshfs.lock);
@@ -1642,6 +1668,7 @@ static void *process_requests(void *data_)
 {
 	(void) data_;
 	struct conn *conn = data_;
+	struct clean_req_ctx ctx = { .conn = conn, .removed_len = 0 };
 
 	while (1) {
 		if (process_one_request(conn) == -1)
@@ -1651,12 +1678,14 @@ static void *process_requests(void *data_)
 	pthread_mutex_lock(&sshfs.lock);
 	conn->processing_thread_started = 0;
 	close_conn(conn);
-	g_hash_table_foreach_remove(sshfs.reqtab, (GHRFunc) clean_req, conn);
+	g_hash_table_foreach_remove(sshfs.reqtab, (GHRFunc) clean_req_counting,
+				    &ctx);
 	/* Nothing cached from the old session may be served after a reconnect */
 	if (sshfs.reconnect && sshfs.dir_cache)
 		cache_invalidate_connection();
 	conn->connver = ++sshfs.connvers;
-	sshfs.outstanding_len = 0;
+	/* Only this connection's requests are gone; others are still counted */
+	subtract_outstanding_locked(ctx.removed_len);
 	pthread_cond_broadcast(&sshfs.outstanding_cond);
 	pthread_mutex_unlock(&sshfs.lock);
 
@@ -2119,6 +2148,8 @@ static int sftp_request_send(struct conn *conn, uint8_t type, struct iovec *iov,
 
 		pthread_mutex_lock(&sshfs.lock);
 		rmed = g_hash_table_remove(sshfs.reqtab, GUINT_TO_POINTER(id));
+		if (rmed)
+			subtract_outstanding_locked(req->len);
 		pthread_mutex_unlock(&sshfs.lock);
 
 		if (!rmed && !want_reply) {
