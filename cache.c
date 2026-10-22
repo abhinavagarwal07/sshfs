@@ -63,6 +63,10 @@ struct file_handle {
 
 	/* If so, this will hold its handle */
 	unsigned long fs_fh;
+
+	/* The counters from just before it was opened */
+	uint64_t epoch;
+	uint64_t wrctr;
 };
 
 struct cache_dirent {
@@ -456,6 +460,8 @@ static int cache_readdir(const char *path, void *buf, fuse_fill_dir_t filler,
 	if(cfi->is_open)
 		fi->fh = cfi->fs_fh;
 	else {
+		cfi->epoch = cache_get_conn_epoch();
+		cfi->wrctr = cache_get_write_ctr();
 		if(cache.next_oper->opendir) {
 			err = cache.next_oper->opendir(path, fi);
 			if(err)
@@ -470,8 +476,13 @@ static int cache_readdir(const char *path, void *buf, fuse_fill_dir_t filler,
 	ch.filler = filler;
 	ch.dir = g_ptr_array_new();
 	g_ptr_array_set_free_func(ch.dir, free_cache_dirent);
-	ch.wrctr = cache_get_write_ctr();
-	ch.epoch = cache_get_conn_epoch();
+	/*
+	 * A handle that was opened before a reconnect belongs to the old
+	 * session, so nothing it returns may be cached.
+	 */
+	ch.epoch = cfi->epoch;
+	ch.wrctr = ch.epoch == cache_get_conn_epoch() ? cache_get_write_ctr()
+						      : cfi->wrctr;
 	/* Always request a fresh, complete enumeration to (re)fill the cache */
 	err = cache.next_oper->readdir(path, &ch, cache_dirfill, 0, fi, flags);
 	g_ptr_array_add(ch.dir, NULL);
