@@ -206,12 +206,15 @@ def _check_ssh_localhost():
 _mount_ctr = [0]
 
 
-def _mount_sshfs(tmpdir, extra_opts=None, src_dir=None, zero_timeouts=True):
+def _mount_sshfs(
+    tmpdir, extra_opts=None, src_dir=None, zero_timeouts=True, ready=os.path.ismount
+):
     """Helper to mount sshfs with custom options. Returns (mount_process, mnt_dir, src_dir).
 
     The remote directory is a fresh one under tmpdir unless src_dir is given.
     The kernel's entry and attribute timeouts are set to 0 unless zero_timeouts
-    is False. sshfs's own directory and attribute cache is not affected.
+    is False. sshfs's own directory and attribute cache is not affected. The
+    mount is up when ready(mnt_dir) says so.
     """
     _check_ssh_localhost()
     _mount_ctr[0] += 1
@@ -236,7 +239,7 @@ def _mount_sshfs(tmpdir, extra_opts=None, src_dir=None, zero_timeouts=True):
 
     mount_process = subprocess.Popen(cmdline, env=new_env)
     try:
-        wait_for_mount(mount_process, mnt_dir)
+        wait_for_mount(mount_process, mnt_dir, ready)
     except BaseException:  # wait_for_mount() fails with pytest.fail()
         cleanup(mount_process, mnt_dir)
         raise
@@ -244,14 +247,16 @@ def _mount_sshfs(tmpdir, extra_opts=None, src_dir=None, zero_timeouts=True):
 
 
 @contextmanager
-def mounted(tmpdir, extra_opts=None, src_dir=None, zero_timeouts=True):
+def mounted(
+    tmpdir, extra_opts=None, src_dir=None, zero_timeouts=True, ready=os.path.ismount
+):
     """Mount sshfs, yield (mnt_dir, src_dir) and unmount again afterwards.
 
     If the body fails (or skips), or the unmount does, cleanup() is called, so
     a failing test doesn't leave an sshfs process behind.
     """
     mount_process, mnt_dir, src_dir = _mount_sshfs(
-        tmpdir, extra_opts, src_dir, zero_timeouts
+        tmpdir, extra_opts, src_dir, zero_timeouts, ready
     )
     try:
         yield mnt_dir, src_dir
