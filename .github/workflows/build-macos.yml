@@ -91,7 +91,7 @@ jobs:
         run: |
           set -o pipefail
           cd build
-          python3 -m pytest test/test_hostname_validation.py test/test_macos_daemonize.py test/test_startup.py --timeout=60 | tee "$RUNNER_TEMP/pytest.log"
+          python3 -m pytest test/test_hostname_validation.py test/test_macos_daemonize.py test/test_startup.py --maxfail=99 --timeout=60 | tee "$RUNNER_TEMP/pytest.log"
           # exactly the expected tests, all passed: no skip, xfail or rename slips by
           grep -Eq '^=+ 8 passed in ' "$RUNNER_TEMP/pytest.log"
 

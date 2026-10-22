@@ -4650,11 +4650,7 @@ int main(int argc, char *argv[])
 		exit(1);
 	}
 
-	/*
-	 * On macOS the FD_CLOEXEC fcntl is deferred until after
-	 * fuse_daemonize() below; see the comment there.
-	 */
-#if !defined(__CYGWIN__) && !defined(__APPLE__)
+#if !defined(__CYGWIN__)
 	res = fcntl(fuse_session_fd(se), F_SETFD, FD_CLOEXEC);
 	if (res == -1)
 		perror("WARNING: failed to set FD_CLOEXEC on fuse device");
@@ -4677,30 +4673,6 @@ int main(int argc, char *argv[])
 		fuse_destroy(fuse);
 		exit(1);
 	}
-
-#ifdef __APPLE__
-	/*
-	 * macFUSE 5.3.3+ mounts lazily: fuse_mount() only records the request,
-	 * and the real mount (and its XPC channel) is created on first use.
-	 * On macOS fuse_session_fd() is such a first use -- it triggers the
-	 * delayed mount and marks the mount as started, after which
-	 * fuse_daemonize() refuses to fork and stays in the foreground
-	 * ("daemonize requested after mount started; continuing in foreground").
-	 *
-	 * So defer the FD_CLOEXEC fcntl until here, after daemonizing: the
-	 * mount is then created in the daemon child, where its XPC connection
-	 * survives, and daemonization still forks as before. The fuse fd does
-	 * not exist yet while the first ssh child is spawned in ssh_connect()
-	 * above, so nothing can leak in that window; setting FD_CLOEXEC now
-	 * still protects the ssh children spawned later on reconnect.
-	 *
-	 * See macFUSE commit 867b5cdb ("Defer mount process until first use on
-	 * macOS") and https://github.com/libfuse/sshfs/issues/338
-	 */
-	res = fcntl(fuse_session_fd(se), F_SETFD, FD_CLOEXEC);
-	if (res == -1)
-		perror("WARNING: failed to set FD_CLOEXEC on fuse device");
-#endif
 
 	if (sshfs.singlethread)
 		res = fuse_loop(fuse);
