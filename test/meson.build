@@ -1,5 +1,6 @@
 test_scripts = [ 'conftest.py', 'pytest.ini', 'test_sshfs.py',
-                 'test_hostname_validation.py', 'util.py' ]
+                 'test_hostname_validation.py', 'test_reconnect_cache.py',
+                 'util.py' ]
 custom_target('test_scripts', input: test_scripts,
               output: test_scripts, build_by_default: true,
               command: ['cp', '-fPp',
@@ -15,6 +16,16 @@ test_cache = executable('test_cache', 'test_cache.c',
                         c_args: ['-DFUSE_USE_VERSION=31'],
                         install: false)
 test('cache', test_cache, suite: 'unit')
+
+# Reconnect handling in cache.c.  Uses the public cache interface only, so
+# cache.c is a normal source here.
+cache_reconnect_unit = executable('cache_reconnect_unit',
+                                  ['cache_reconnect_unit.c', '../cache.c'],
+                                  include_directories: include_dirs,
+                                  dependencies: sshfs_deps,
+                                  c_args: ['-DFUSE_USE_VERSION=31'],
+                                  install: false)
+test('cache_reconnect', cache_reconnect_unit, suite: 'unit')
 
 # Provide something helpful when running 'ninja test'
 wrong_cmd = executable('wrong_command', 'wrong_command.c',

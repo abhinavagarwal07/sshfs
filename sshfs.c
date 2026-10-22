@@ -1652,6 +1652,9 @@ static void *process_requests(void *data_)
 	conn->processing_thread_started = 0;
 	close_conn(conn);
 	g_hash_table_foreach_remove(sshfs.reqtab, (GHRFunc) clean_req, conn);
+	/* Nothing cached from the old session may be served after a reconnect */
+	if (sshfs.reconnect && sshfs.dir_cache)
+		cache_invalidate_connection();
 	conn->connver = ++sshfs.connvers;
 	sshfs.outstanding_len = 0;
 	pthread_cond_broadcast(&sshfs.outstanding_cond);
