@@ -1377,7 +1377,7 @@ static int connect_vsock(struct conn *conn, char *vsock)
  * Duplicate fd (not onto 0..2, so that stray stdio can never hit it).  Called
  * with sshfs.lock held, which also keeps the fallback away from start_ssh().
  */
-static int dup_cloexec(int fd)
+__attribute__((unused)) static int dup_cloexec(int fd)
 {
 #ifdef F_DUPFD_CLOEXEC
 	return fcntl(fd, F_DUPFD_CLOEXEC, 3);
@@ -2148,7 +2148,6 @@ static int sftp_request_send_connver(struct conn *conn, int expected_connver,
 {
 	int err;
 	uint32_t id;
-	int wfd = -1;
 	int send_res;
 	struct request *req = g_new0(struct request, 1);
 
@@ -2176,27 +2175,11 @@ static int sftp_request_send_connver(struct conn *conn, int expected_connver,
 	}
 	req->len = iov_length(iov, count) + 9;
 	sshfs.outstanding_len += req->len;
-	while (sshfs.outstanding_len > sshfs.max_outstanding_len) {
-		/* The lock is dropped while waiting; the connection may be gone */
+	while (sshfs.outstanding_len > sshfs.max_outstanding_len)
 		pthread_cond_wait(&sshfs.outstanding_cond, &sshfs.lock);
-		if (expected_connver != CONNVER_ANY &&
-		    conn->connver != expected_connver)
-			goto out_counted;
-	}
 
-	/*
-	 * The lock is dropped for the write below and the connection may be torn
-	 * down and set up again before it happens. Write to our own reference to
-	 * the socket that was just checked, so that the request cannot end up on
-	 * a newer session that reuses the descriptor number.
-	 */
 	if (conn->wfd == -1)
 		goto out_counted;
-	wfd = dup_cloexec(conn->wfd);
-	if (wfd == -1) {
-		perror("dup");
-		goto out_counted;
-	}
 
 	g_hash_table_insert(sshfs.reqtab, GUINT_TO_POINTER(id), req);
 	if (sshfs.debug) {
@@ -2207,8 +2190,7 @@ static int sftp_request_send_connver(struct conn *conn, int expected_connver,
 	DEBUG("[%05i] %s\n", id, type_name(type));
 	pthread_mutex_unlock(&sshfs.lock);
 
-	send_res = sftp_send_iov(conn, wfd, type, id, iov, count);
-	close(wfd);
+	send_res = sftp_send_iov(conn, conn->wfd, type, id, iov, count);
 	err = -EIO;
 	if (send_res == -1) {
 		gboolean rmed;
