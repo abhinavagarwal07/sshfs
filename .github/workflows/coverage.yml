@@ -13,7 +13,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  group: ${{ github.workflow }}-${{ github.event_name == 'workflow_dispatch' && format('dispatch-{0}', github.ref) || (github.event.pull_request.number || github.ref) }}
   cancel-in-progress: true
 
 jobs:
@@ -105,10 +105,17 @@ jobs:
           TESTS_OUTCOME: ${{ steps.tests.outcome }}
           TEST_CHECK_OUTCOME: ${{ steps.test_check.outcome }}
         run: |
-          mkdir coverage
-          gcovr --root . --filter 'sshfs\.c' --filter 'cache\.c' \
+          for src in sshfs.c cache.c; do
+            if [ ! -s "build/sshfs.p/$src.gcda" ]; then
+              echo "::warning::no runtime coverage data for $src"
+              echo "Coverage unavailable: build/sshfs.p/$src.gcda is missing." >> "$GITHUB_STEP_SUMMARY"
+              exit 0
+            fi
+          done
+          mkdir -p coverage
+          gcovr --root . --filter '^sshfs\.c$' --filter '^cache\.c$' \
                 --print-summary --json-summary coverage/summary.json \
-                --html-details coverage/index.html build
+                --html-details coverage/index.html build/sshfs.p
           {
             echo '### Coverage of sshfs.c and cache.c'
             echo
@@ -137,4 +144,4 @@ jobs:
             coverage/
             build/test-results.xml
           retention-days: 14
-          if-no-files-found: ignore
+          if-no-files-found: warn
