@@ -959,6 +959,31 @@ static void test_new_values_after_ops(void)
 	CHECK((st.st_mode & 07777) == 0640 && (st2.st_mode & 07777) == 0640);
 }
 
+/* each name is read only after the change: the cache keeps attributes per path */
+static void test_hard_link_aliases(void)
+{
+	struct stat st;
+	ino_t ino;
+
+	mk_file("/a", 1);
+	mk_file("/c", 1);
+	mk_file("/e", 1);
+	CHECK(ops->link("/a", "/b") == 0);
+	CHECK(ops->link("/c", "/d") == 0);
+	CHECK(ops->link("/e", "/f") == 0);
+
+	CHECK(ops->truncate("/a", 100, NULL) == 0);
+	CHECK(size_of("/b") == 100);
+	CHECK(ops->write("/c", "x", 1, 200, NULL) == 1);	/* extends */
+	CHECK(size_of("/d") == 201);
+
+	/* unlinking one name leaves the other as the only link */
+	ino = ent_get("/e")->ino;
+	CHECK(ops->unlink("/e") == 0);
+	REQUIRE(get_cached("/f", &st) == 0);
+	CHECK(st.st_nlink == 1 && st.st_ino == ino && st.st_size == 1);
+}
+
 static void test_cache_invalidate(void)
 {
 	mk_file("/f", 1);
@@ -1758,6 +1783,8 @@ static const struct tcase cases[] = {
 	  test_invalidation, NULL },
 	{ "invalidate: next getattr returns the new value",
 	  test_new_values_after_ops, NULL },
+	{ "hard link: truncate and write show under the other name, unlink leaves one",
+	  test_hard_link_aliases, NULL },
 	{ "invalidate: cache_invalidate drops one path",
 	  test_cache_invalidate, NULL },
 	{ "rename: children of the old name are dropped",
