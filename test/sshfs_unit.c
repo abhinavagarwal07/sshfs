@@ -544,8 +544,14 @@ static int t_wait_socket_full(int fd)
 	int i;
 
 	for (i = 0; i < T_TIMEOUT_SECS * 1000; i++) {
-		if (poll(&pfd, 1, 0) == 0)
+		int res = poll(&pfd, 1, 0);
+
+		if (res == 0)
 			return 0;
+		if (res == -1 && errno != EINTR)
+			return -1;
+		if (res > 0 && (pfd.revents & (POLLERR | POLLHUP | POLLNVAL)))
+			return -1;
 		usleep(1000);
 	}
 	return -1;
