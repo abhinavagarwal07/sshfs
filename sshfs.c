@@ -2123,6 +2123,7 @@ static int sftp_request_send_connver(struct conn *conn, int expected_connver,
 				     void *data, struct request **reqp)
 {
 	int err;
+	int connver;
 	uint32_t id;
 	int wfd = -1;
 	int send_res;
@@ -2150,18 +2151,19 @@ static int sftp_request_send_connver(struct conn *conn, int expected_connver,
 		pthread_mutex_unlock(&sshfs.lock);
 		goto out;
 	}
+	connver = conn->connver;
 	req->len = iov_length(iov, count) + 9;
 	/*
 	 * Only requests in the table are counted, so one that waits for room
-	 * has nothing to give back if its connection goes away meanwhile.
+	 * has nothing to give back if its connection goes away meanwhile. It
+	 * must not go on waiting then, as the room may be held by another
+	 * connection.
 	 */
 	while (sshfs.outstanding_len &&
 	       (uint64_t) sshfs.outstanding_len + req->len >
 	       sshfs.max_outstanding_len) {
-		/* The lock is dropped while waiting; the connection may be gone */
 		pthread_cond_wait(&sshfs.outstanding_cond, &sshfs.lock);
-		if (expected_connver != CONNVER_ANY &&
-		    conn->connver != expected_connver)
+		if (conn->connver != connver)
 			goto out_unlock;
 	}
 
