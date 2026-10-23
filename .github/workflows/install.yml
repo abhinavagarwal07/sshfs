@@ -8,14 +8,11 @@ on:
   workflow_dispatch:
     inputs:
       git-ref:
-        description: Git ref to test, e.g. refs/pull/123/merge (optional)
+        description: Commit SHA or full ref to test, e.g. refs/pull/123/merge (optional)
         required: false
 
 permissions:
   contents: read
-
-# nothing here needs to save a cache, and dispatch runs may build other refs
-cache-mode: read
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || (github.event_name == 'workflow_dispatch' && format('dispatch-{0}', inputs.git-ref || github.ref)) || github.ref }}
