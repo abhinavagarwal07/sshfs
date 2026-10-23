@@ -2084,6 +2084,7 @@ static int sftp_request_send(struct conn *conn, uint8_t type, struct iovec *iov,
 			     int want_reply, void *data, struct request **reqp)
 {
 	int err;
+	int connver;
 	uint32_t id;
 	struct request *req = g_new0(struct request, 1);
 
@@ -2104,15 +2105,21 @@ static int sftp_request_send(struct conn *conn, uint8_t type, struct iovec *iov,
 		pthread_mutex_unlock(&sshfs.lock);
 		goto out;
 	}
+	connver = conn->connver;
 	req->len = iov_length(iov, count) + 9;
 	/*
 	 * Only requests in the table are counted, so one that waits for room
-	 * has nothing to give back if its connection goes away meanwhile.
+	 * has nothing to give back if its connection goes away meanwhile. It
+	 * must not go on waiting then, as the room may be held by another
+	 * connection.
 	 */
 	while (sshfs.outstanding_len &&
 	       (uint64_t) sshfs.outstanding_len + req->len >
-	       sshfs.max_outstanding_len)
+	       sshfs.max_outstanding_len) {
 		pthread_cond_wait(&sshfs.outstanding_cond, &sshfs.lock);
+		if (conn->connver != connver)
+			goto out_unlock;
+	}
 	sshfs.outstanding_len += req->len;
 
 	g_hash_table_insert(sshfs.reqtab, GUINT_TO_POINTER(id), req);
@@ -2144,6 +2151,9 @@ static int sftp_request_send(struct conn *conn, uint8_t type, struct iovec *iov,
 		*reqp = req;
 	return 0;
 
+out_unlock:
+	pthread_mutex_unlock(&sshfs.lock);
+	err = -EIO;
 out:
 	req->error = err;
 	if (!want_reply)
