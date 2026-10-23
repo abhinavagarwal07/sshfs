@@ -14,6 +14,10 @@ on:
 permissions:
   contents: read
 
+# dispatch runs may build other refs, whose build code can reach the cache
+# credentials of later action steps, so don't let them save caches
+cache-mode: read
+
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || (github.event_name == 'workflow_dispatch' && format('dispatch-{0}', inputs.git-ref || github.ref)) || github.ref }}
   cancel-in-progress: true
