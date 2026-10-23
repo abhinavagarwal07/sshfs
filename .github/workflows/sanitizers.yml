@@ -60,8 +60,6 @@ jobs:
         run: |
           test -e /dev/fuse
           command -v fusermount3
-          # test/util.py looks for the legacy name and skips the mount tests without it
-          command -v fusermount || sudo ln -s "$(command -v fusermount3)" /usr/local/bin/fusermount
 
       - name: Build
         env:
@@ -77,6 +75,7 @@ jobs:
           LSAN_OPTIONS: "${{ matrix.sanitizer == 'asan' && format('suppressions={0}/test/lsan_suppress.txt', github.workspace) || '' }}"
           UBSAN_OPTIONS: "${{ matrix.sanitizer == 'ubsan' && format('{0}:log_path={1}/sanitizer/ubsan', matrix.san_opts, runner.temp) || '' }}"
           ASAN_SYMBOLIZER_PATH: /usr/bin/llvm-symbolizer
+          SSHFS_TEST_REQUIRE_FUSE: 1
         run: |
           mkdir -p "$RUNNER_TEMP/sanitizer"
           cd build
@@ -100,7 +99,8 @@ jobs:
             exit 1
           fi
 
-      # A missing FUSE prerequisite makes the mount tests skip, not fail.
+      # SSHFS_TEST_REQUIRE_FUSE makes a missing FUSE prerequisite fail; this
+      # catches any other skipped test.
       - name: Check no tests were skipped
         run: |
           python3 - build/test-results.xml <<'EOF'

@@ -3,9 +3,38 @@ import subprocess
 import pytest
 import os
 import stat
+import re
 import time
+import shutil
 from os.path import join as pjoin
 from contextlib import contextmanager
+
+
+def _find_fusermount():
+    """Return the name of the FUSE 3 fusermount, or None
+
+    libfuse 3 installs fusermount3; some distros also have a fusermount, which
+    may belong to FUSE 2 and is no use here.
+    """
+    if shutil.which("fusermount3"):
+        return "fusermount3"
+    if shutil.which("fusermount"):
+        try:
+            out = subprocess.run(
+                ["fusermount", "--version"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                universal_newlines=True,
+                timeout=10,
+            ).stdout
+        except (OSError, subprocess.SubprocessError):
+            return None
+        if re.search(r"version:\s*3\.", out):
+            return "fusermount"
+    return None
+
+
+FUSERMOUNT_BIN = _find_fusermount() or "fusermount3"
 
 basename = pjoin(os.path.dirname(__file__), "..")
 
@@ -36,20 +65,30 @@ def wait_for_mount(mount_process, mnt_dir, test_fn=os.path.ismount):
 
 
 def cleanup(mount_process, mnt_dir):
-    subprocess.call(
-        ["fusermount", "-z", "-u", mnt_dir],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.STDOUT,
-    )
-    mount_process.terminate()
     try:
-        mount_process.wait(1)
-    except subprocess.TimeoutExpired:
-        mount_process.kill()
+        subprocess.call(
+            [FUSERMOUNT_BIN, "-z", "-u", mnt_dir],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.STDOUT,
+            timeout=10,
+        )
+    except (subprocess.TimeoutExpired, OSError):
+        pass
+    finally:
+        # give it time to exit by itself, SIGTERM cuts its shutdown short
+        try:
+            mount_process.wait(5)
+        except subprocess.TimeoutExpired:
+            mount_process.terminate()
+            try:
+                mount_process.wait(1)
+            except subprocess.TimeoutExpired:
+                mount_process.kill()
+                mount_process.wait()
 
 
 def umount(mount_process, mnt_dir):
-    subprocess.check_call(["fusermount3", "-z", "-u", mnt_dir])
+    subprocess.check_call([FUSERMOUNT_BIN, "-z", "-u", mnt_dir])
     assert not os.path.ismount(mnt_dir)
 
     # Give mount process a little while to terminate. Popen.wait(timeout)
@@ -81,24 +120,38 @@ def safe_sleep(secs):
         now = time.time()
 
 
+def require_fuse():
+    """Return True if tests that can't run must fail instead of skip
+
+    CI sets SSHFS_TEST_REQUIRE_FUSE so that a runner without working FUSE
+    fails instead of reporting green with every test skipped.
+    """
+    return os.environ.get("SSHFS_TEST_REQUIRE_FUSE", "no").lower().strip() not in (
+        "",
+        "no",
+        "off",
+        "false",
+        "0",
+    )
+
+
 def fuse_test_marker():
     """Return a pytest.marker that indicates FUSE availability
 
     If system/user/environment does not support FUSE, return
-    a `pytest.mark.skip` object with more details. If FUSE is
-    supported, return `pytest.mark.uses_fuse()`.
+    a `pytest.mark.skip` object with more details, or fail if
+    require_fuse() is true. If FUSE is supported, return
+    `pytest.mark.uses_fuse()`.
     """
 
     def skip(reason: str):
+        if require_fuse():
+            pytest.fail(f"FUSE tests required but unusable: {reason}", pytrace=False)
         return pytest.mark.skip(reason=reason)
 
-    with subprocess.Popen(
-        ["which", "fusermount"], stdout=subprocess.PIPE, universal_newlines=True
-    ) as which:
-        fusermount_path = which.communicate()[0].strip()
-
-    if not fusermount_path or which.returncode != 0:
-        return skip("Can't find fusermount executable")
+    fusermount_path = shutil.which(FUSERMOUNT_BIN)
+    if not fusermount_path:
+        return skip("Can't find a FUSE 3 fusermount executable")
 
     if not os.path.exists("/dev/fuse"):
         return skip("FUSE kernel module does not seem to be loaded")

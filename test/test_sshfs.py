@@ -23,6 +23,7 @@ from util import (
     base_cmdline,
     basename,
     fuse_test_marker,
+    require_fuse,
     safe_sleep,
     os_create,
     os_open,
@@ -76,29 +77,7 @@ def test_sshfs(
     capfd.register_output(r"^Warning: Permanently added 'localhost' .+", count=0)
 
     # Test if we can ssh into localhost without password
-    try:
-        res = subprocess.call(
-            [
-                "ssh",
-                "-o",
-                "StrictHostKeyChecking=no",
-                "-o",
-                "KbdInteractiveAuthentication=no",
-                "-o",
-                "ChallengeResponseAuthentication=no",
-                "-o",
-                "PasswordAuthentication=no",
-                "localhost",
-                "--",
-                "true",
-            ],
-            stdin=subprocess.DEVNULL,
-            timeout=10,
-        )
-    except subprocess.TimeoutExpired:
-        res = 1
-    if res != 0:
-        pytest.fail("Unable to ssh into localhost without password prompt.")
+    _check_ssh_localhost()
 
     mnt_dir = str(tmpdir.mkdir("mnt"))
     src_dir = str(tmpdir.mkdir("src"))
@@ -754,15 +733,19 @@ def tst_passthrough(src_dir, mnt_dir, cache_timeout):
     assert abs(src_st.st_mtime - mnt_st.st_mtime) <= 1
 
 
+SSH_LOCALHOST = [
+    "ssh", "-o", "StrictHostKeyChecking=no",
+    "-o", "KbdInteractiveAuthentication=no",
+    "-o", "ChallengeResponseAuthentication=no",
+    "-o", "PasswordAuthentication=no",
+    "localhost", "--",
+]
+
+
 def _check_ssh_localhost():
     try:
         res = subprocess.call(
-            ["ssh", "-o", "StrictHostKeyChecking=no",
-             "-o", "KbdInteractiveAuthentication=no",
-             "-o", "ChallengeResponseAuthentication=no",
-             "-o", "PasswordAuthentication=no",
-             "localhost", "--", "true"],
-            stdin=subprocess.DEVNULL, timeout=10,
+            SSH_LOCALHOST + ["true"], stdin=subprocess.DEVNULL, timeout=10
         )
     except subprocess.TimeoutExpired:
         res = 1
@@ -804,12 +787,70 @@ def _mount_sshfs(tmpdir, extra_opts=None):
     return mount_process, mnt_dir, src_dir
 
 
+def test_chown_group(tmpdir, capfd):
+    capfd.register_output(r"^Warning: Permanently added 'localhost' .+", count=0)
+
+    # The owner of a file may chgrp it to any group they are a member of.
+    # Without a second group there is nothing to test; CI must not lose the
+    # test that way, so it fails there. The chgrp is done by the SFTP server,
+    # so only use groups its session has too, and pick the target after
+    # creating the directory, which may inherit a group from a setgid parent.
+    server_groups = subprocess.check_output(
+        SSH_LOCALHOST + ["id", "-G"],
+        stdin=subprocess.DEVNULL, timeout=10, universal_newlines=True,
+    ).split()
+    groups = [
+        g for g in dict.fromkeys([os.getgid(), *os.getgroups()])
+        if str(g) in server_groups
+    ]
+    if os.getuid() == 0 and len(groups) < 2:
+        # a root server may chgrp to any gid
+        uid = subprocess.check_output(
+            SSH_LOCALHOST + ["id", "-u"],
+            stdin=subprocess.DEVNULL, timeout=10, universal_newlines=True,
+        )
+        if uid.strip() == "0":
+            groups = [os.getgid(), os.getgid() + 1]
+    if len(groups) < 2:
+        reason = "user has no second group to chgrp to"
+        if require_fuse():
+            pytest.fail(reason)
+        pytest.skip(reason)
+
+    mount_process, mnt_dir, src_dir = _mount_sshfs(tmpdir, [])
+    try:
+        name = name_generator()
+        filename = pjoin(mnt_dir, name)
+        os.mkdir(filename)
+        fstat = os.lstat(filename)
+        gid_new = [g for g in groups if g != fstat.st_gid][0]
+
+        os.chown(filename, -1, gid_new)
+        for path in (filename, pjoin(src_dir, name)):
+            nstat = os.lstat(path)
+            assert nstat.st_gid == gid_new
+            assert nstat.st_uid == fstat.st_uid
+
+        # chown to the current owner changes nothing
+        os.chown(filename, fstat.st_uid, -1)
+        nstat = os.lstat(filename)
+        assert nstat.st_gid == gid_new
+        assert nstat.st_uid == fstat.st_uid
+    except Exception:
+        cleanup(mount_process, mnt_dir)
+        raise
+    else:
+        umount(mount_process, mnt_dir)
+
+
 def test_disable_hardlink(tmpdir, capfd):
     capfd.register_output(r"^Warning: Permanently added 'localhost' .+", count=0)
 
     # Control: verify hardlinks work without disable_hardlink.
-    # If the server lacks the extension, skip this test entirely.
+    # If the server lacks the extension, skip this test entirely. Any other
+    # failure of os.link() is a real error.
     mount_process, mnt_dir, src_dir = _mount_sshfs(tmpdir, [])
+    unsupported = False
     try:
         name1 = pjoin(mnt_dir, name_generator())
         name2 = pjoin(mnt_dir, name_generator())
@@ -817,16 +858,21 @@ def test_disable_hardlink(tmpdir, capfd):
             fh.write(b"test")
         try:
             os.link(name1, name2)
-        except OSError:
+        except OSError as exc:
             os.unlink(name1)
-            pytest.skip("server does not support hardlink extension")
-        os.unlink(name2)
-        os.unlink(name1)
+            if exc.errno not in (errno.ENOSYS, errno.EOPNOTSUPP):
+                raise
+            unsupported = True
+        else:
+            os.unlink(name2)
+            os.unlink(name1)
     except Exception:
         cleanup(mount_process, mnt_dir)
         raise
     else:
         umount(mount_process, mnt_dir)
+    if unsupported:
+        pytest.skip("server does not support hardlink extension")
 
     # Now test with disable_hardlink — links should fail
     mount_process, mnt_dir, src_dir = _mount_sshfs(tmpdir, ["disable_hardlink"])
