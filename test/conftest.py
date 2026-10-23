@@ -15,7 +15,8 @@ import re
 def pytest_pyfunc_call(pyfuncitem):
     outcome = yield
     failed = outcome.excinfo is not None
-    if failed:
+    # no wait for an xfail: the late output is only wanted from real failures
+    if failed and (pyfuncitem.get_closest_marker("xfail") is None or pyfuncitem.config.option.runxfail):
         time.sleep(1)
 
 
