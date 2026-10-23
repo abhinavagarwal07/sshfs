@@ -111,3 +111,55 @@ def pytest_runtest_call(item):
     capfd = current_capfd
     if capfd is not None:
         check_test_output(capfd)
+
+
+class _NoSkips:
+    def __init__(self):
+        self.ran = self.skipped = self.fuse = 0
+
+    def pytest_collectreport(self, report):
+        self.skipped += report.skipped
+
+    def pytest_runtest_logreport(self, report):
+        self.ran += report.when == "call"
+        self.fuse += report.when == "call" and "uses_fuse" in report.keywords
+        # an expected failure counts if it ran and the xfail is declared, not
+        # raised by pytest.xfail() in the test (see below) or never started
+        self.skipped += report.skipped and not (
+            report.when == "call" and hasattr(report, "wasxfail") and "xfail" in report.keywords
+        )
+
+    @pytest.hookimpl(hookwrapper=True)
+    def pytest_runtest_makereport(self, item, call):
+        yield
+        if call.excinfo is not None and isinstance(call.excinfo.value, pytest.xfail.Exception):
+            self.skipped += 1
+
+    def pytest_deselected(self, items):
+        self.skipped += len(items)
+
+    @pytest.hookimpl(trylast=True)
+    def pytest_sessionfinish(self, session):
+        if session.exitstatus == pytest.ExitCode.OK and (
+            self.skipped or not self.ran or not self.fuse
+        ):
+            session.exitstatus = pytest.ExitCode.TESTS_FAILED
+            reporter = session.config.pluginmanager.get_plugin("terminalreporter")
+            if reporter is not None:
+                reporter.write_sep(
+                    "=", f"{self.skipped} test(s) skipped, {self.ran} ran, {self.fuse} used FUSE"
+                )
+
+
+def pytest_addoption(parser):
+    parser.addoption("--sshfs-no-skips", action="store_true",
+                     help="fail the run if a test is skipped, or none that uses FUSE ran")
+
+
+def pytest_configure(config):
+    if not config.getoption("sshfs_no_skips"):
+        return
+    if config.getoption("numprocesses", default=0) or \
+       config.getoption("dist", default="no") != "no":
+        raise pytest.UsageError("--sshfs-no-skips needs a serial run")
+    config.pluginmanager.register(_NoSkips(), "sshfs-no-skips")

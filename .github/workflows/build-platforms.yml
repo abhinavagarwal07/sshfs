@@ -84,7 +84,7 @@ jobs:
         timeout-minutes: 20
         run: |
           cd build
-          python3 -m pytest test/ --timeout=300 --maxfail=99 --junitxml=test-results.xml
+          python3 -m pytest test/ --timeout=300 --maxfail=99 --junitxml=test-results.xml --sshfs-no-skips
 
       - name: Upload test results
         if: matrix.run_tests && always()
