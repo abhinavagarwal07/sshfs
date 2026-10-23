@@ -485,6 +485,59 @@ static int t_test_waiting_senders_are_not_stranded(void)
 	return 0;
 }
 
+/*
+ * A request that waits for room, because another connection is using it,
+ * must give up when its own connection is lost, rather than go back to sleep
+ * until the other connection frees the room.
+ */
+static int t_test_waiting_sender_gives_up_with_its_connection(void)
+{
+	struct t_responder ra;
+	struct t_responder rb;
+	struct t_job other;
+	struct t_job waiter;
+	struct t_count count = { .conn = &sshfs.conns[0], .want = 1 };
+	pthread_t tother;
+	pthread_t twaiter;
+	unsigned n = 1;
+
+	t_responder_init(&ra);
+	t_responder_init(&rb);
+	t_job_init(&other, &sshfs.conns[1], 67);	/* 80 bytes */
+	t_job_init(&waiter, &sshfs.conns[0], 47);	/* 60 bytes */
+	sshfs.max_outstanding_len = 100;
+	if (t_session_start(&sshfs.conns[0], &ra) == -1 ||
+	    t_session_start(&sshfs.conns[1], &rb) == -1)
+		return t_fail("could not start the sessions");
+
+	t_responder_hold(&rb, 1);
+	if (pthread_create(&tother, NULL, t_job_thread, &other) != 0)
+		return t_fail("pthread_create failed");
+	if (t_wait_until(t_reqtab_size_is, &n) == -1)
+		return t_fail("first request was not sent");
+	if (pthread_create(&twaiter, NULL, t_job_thread, &waiter) != 0)
+		return t_fail("pthread_create failed");
+	if (t_wait_until(t_req_count_is, &count) == -1)
+		return t_fail("second request was not taken");
+
+	/* Its connection goes away while the other one still holds the room */
+	if (t_session_drop(&sshfs.conns[0], &ra) == -1)
+		return t_fail("connection 0 was not torn down");
+	pthread_join(twaiter, NULL);
+	if (waiter.res != -EIO)
+		return t_fail("waiting request did not fail with its "
+			      "connection");
+
+	t_responder_hold(&rb, 0);
+	pthread_join(tother, NULL);
+	if (t_session_drop(&sshfs.conns[1], &rb) == -1)
+		return t_fail("connection 1 was not torn down");
+	sshfs.max_outstanding_len = ~0U;
+	if (!t_idle())
+		return t_fail("requests left behind or still counted");
+	return 0;
+}
+
 int main(void)
 {
 	int i;
@@ -510,6 +563,8 @@ int main(void)
 	if (t_test_failed_send_is_refunded() != 0)
 		return 1;
 	if (t_test_waiting_senders_are_not_stranded() != 0)
+		return 1;
+	if (t_test_waiting_sender_gives_up_with_its_connection() != 0)
 		return 1;
 
 	return 0;
