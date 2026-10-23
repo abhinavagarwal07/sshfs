@@ -13,7 +13,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.event_name == 'workflow_dispatch' && format('dispatch-{0}', github.ref) || (github.event.pull_request.number || github.ref) }}
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
 jobs:
@@ -72,7 +72,7 @@ jobs:
 
       # The mount tests skip when FUSE is unusable, and then the numbers mean
       # nothing. xfails are recorded as skips in the XML but are fine.
-      - name: Check that the tests ran
+      - name: Check that the mount tests ran
         id: test_check
         run: |
           python3 - build/test-results.xml <<'PY'
@@ -87,8 +87,14 @@ jobs:
               if c.find("skipped") is not None
               and c.find("skipped").get("type") != "pytest.xfail"
           ]
-          if not cases:
-              sys.exit("::error::no tests ran")
+          mounted = [
+              c
+              for c in cases
+              if c.get("name", "").startswith("test_sshfs[")
+              and not any(c.find(t) is not None for t in ("failure", "error", "skipped"))
+          ]
+          if not mounted:
+              sys.exit("::error::no mount test ran")
           if skipped:
               sys.exit(f"::error::{len(skipped)} test(s) were skipped: {', '.join(skipped)}")
           PY
