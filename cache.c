@@ -299,6 +299,15 @@ static uint64_t cache_get_conn_epoch(void)
 	return res;
 }
 
+/* The counters of a directory handle taken together, as of when it was opened */
+static void cache_get_counters(uint64_t *epoch, uint64_t *wrctr)
+{
+	pthread_mutex_lock(&cache.lock);
+	*epoch = cache.conn_epoch;
+	*wrctr = cache.write_ctr;
+	pthread_mutex_unlock(&cache.lock);
+}
+
 uint64_t cache_get_write_ctr(void)
 {
 	uint64_t res;
@@ -460,8 +469,7 @@ static int cache_readdir(const char *path, void *buf, fuse_fill_dir_t filler,
 	if(cfi->is_open)
 		fi->fh = cfi->fs_fh;
 	else {
-		cfi->epoch = cache_get_conn_epoch();
-		cfi->wrctr = cache_get_write_ctr();
+		cache_get_counters(&cfi->epoch, &cfi->wrctr);
 		if(cache.next_oper->opendir) {
 			err = cache.next_oper->opendir(path, fi);
 			if(err)
@@ -481,8 +489,9 @@ static int cache_readdir(const char *path, void *buf, fuse_fill_dir_t filler,
 	 * session, so nothing it returns may be cached.
 	 */
 	ch.epoch = cfi->epoch;
-	ch.wrctr = ch.epoch == cache_get_conn_epoch() ? cache_get_write_ctr()
-						      : cfi->wrctr;
+	pthread_mutex_lock(&cache.lock);
+	ch.wrctr = ch.epoch == cache.conn_epoch ? cache.write_ctr : cfi->wrctr;
+	pthread_mutex_unlock(&cache.lock);
 	/* Always request a fresh, complete enumeration to (re)fill the cache */
 	err = cache.next_oper->readdir(path, &ch, cache_dirfill, 0, fi, flags);
 	g_ptr_array_add(ch.dir, NULL);
