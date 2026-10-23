@@ -128,52 +128,42 @@ jobs:
 
   # quay.io garbage-collects old digests within weeks, so CentOS is a plain tag.
   # meson and ninja-build are only in CRB on EL9.
-  centos-stream9:
-    name: centos-stream9
+  rpm-build:
+    name: ${{ matrix.name }}
     runs-on: ubuntu-24.04
     timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: centos-stream9
+            image: quay.io/centos/centos:stream9
+            dnf_args: --enablerepo=crb
+          - name: fedora-latest
+            image: fedora:latest@sha256:43b29f65a41eb9c35e1cd5323e3bdf3b655c2357a9f4f1ff2f9c2798e5045d80
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - name: Build in CentOS Stream 9 container
+      - name: Build in container
+        env:
+          IMAGE: ${{ matrix.image }}
+          DNF_ARGS: ${{ matrix.dnf_args }}
         run: |
-          docker run --rm -v "$PWD:/work" -w /work quay.io/centos/centos:stream9 sh -euxc '
-            dnf install -y --enablerepo=crb gcc meson ninja-build pkg-config glib2-devel fuse3-devel
-            meson setup build-centos -Dwerror=true
-            ninja -C build-centos
+          docker run --rm -e DNF_ARGS -v "$PWD:/work" -w /work "$IMAGE" sh -euxc '
+            dnf install -y $DNF_ARGS gcc meson ninja-build pkg-config glib2-devel fuse3-devel
+            meson setup build-rpm -Dwerror=true
+            ninja -C build-rpm
           '
 
       - name: Upload build logs
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         if: failure()
         with:
-          name: build-logs-centos-stream9
-          path: build-centos/meson-logs/
+          name: build-logs-${{ matrix.name }}
+          path: build-rpm/meson-logs/
 
-  fedora-latest:
-    name: fedora-latest
-    runs-on: ubuntu-24.04
-    timeout-minutes: 15
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-
-      - name: Build in Fedora container
-        run: |
-          docker run --rm -v "$PWD:/work" -w /work fedora:latest@sha256:43b29f65a41eb9c35e1cd5323e3bdf3b655c2357a9f4f1ff2f9c2798e5045d80 sh -euxc '
-            dnf install -y gcc meson ninja-build pkg-config glib2-devel fuse3-devel
-            meson setup build-fedora -Dwerror=true
-            ninja -C build-fedora
-          '
-
-      - name: Upload build logs
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        if: failure()
-        with:
-          name: build-logs-fedora-latest
-          path: build-fedora/meson-logs/
-
-  # Advisory: runs the pytest suite against real FUSE + sshd in a privileged
-  # container. A failure here does not fail the workflow.
+  # Advisory: runs the pytest suite against real FUSE + sshd in a container with
+  # CAP_SYS_ADMIN. A failure here does not fail the workflow.
   rpm-runtime:
     name: ${{ matrix.name }} (runtime)
     runs-on: ubuntu-24.04
@@ -204,16 +194,17 @@ jobs:
             -v "$PWD:/work" -w /work "$IMAGE" sh -euxc '
             # which: test/util.py runs it, and the Fedora image does not ship it
             dnf install -y $DNF_ARGS gcc meson ninja-build pkg-config glib2-devel fuse3-devel \
-              fuse3 openssh-server openssh-clients python3-pip which
+              fuse3 openssh-server openssh-clients python3-pip which sudo
             pip3 install pytest pytest-timeout
-            meson setup build-rpm
-            ninja -C build-rpm
             # test/util.py looks for the legacy name and skips the mount tests without it
             command -v fusermount || ln -s "$(command -v fusermount3)" /usr/bin/fusermount
-            # run the tests as the owner of the bind mount, like the runner on the Ubuntu jobs
+            # build and test as the owner of the bind mount, like the runner on the Ubuntu jobs
             useradd -m -u "$(stat -c %u /work)" -G wheel tester
             usermod -p "*" tester
-            chown -R tester /work/build-rpm
+            # passwordless sudo, as on the Ubuntu runner; some tests mount a tmpfs with it
+            echo "tester ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/tester
+            chmod 440 /etc/sudoers.d/tester
+            runuser -l tester -c "cd /work && meson setup build-rpm && ninja -C build-rpm"
             install -d -m 700 -o tester /home/tester/.ssh
             runuser -u tester -- ssh-keygen -t ed25519 -f /home/tester/.ssh/id_ed25519 -q -N ""
             install -m 600 -o tester /home/tester/.ssh/id_ed25519.pub /home/tester/.ssh/authorized_keys
@@ -223,6 +214,7 @@ jobs:
             # the PAM account check fails in these containers (pam_acct_mgmt returns 9)
             /usr/sbin/sshd -E /work/build-rpm/sshd.log -o LogLevel=VERBOSE -o UsePAM=no
             ls -l "$(command -v fusermount3)" /dev/fuse
+            runuser -l tester -c "sudo -n true"
             runuser -l tester -c "ssh -o ConnectionAttempts=10 -o StrictHostKeyChecking=no -o BatchMode=yes localhost true" || {
               runuser -l tester -c "ssh -v -o StrictHostKeyChecking=no -o BatchMode=yes localhost true" || true
               cat /work/build-rpm/sshd.log
