@@ -471,6 +471,7 @@ static int fake_link(const char *from, const char *to)
 		return -EEXIST;
 	l = ent_add(to, e->mode, e->size);
 	l->ino = e->ino;
+	g_strlcpy(l->link, e->link, sizeof(l->link));
 	l->uid = e->uid;
 	l->gid = e->gid;
 	l->atime = e->atime;
@@ -958,6 +959,7 @@ static void test_new_values_after_ops(void)
 static void test_hard_link_aliases(void)
 {
 	struct stat st;
+	char buf[64];
 	ino_t ino;
 
 	mk_file("/a", 1);
@@ -977,6 +979,12 @@ static void test_hard_link_aliases(void)
 	CHECK(ops->unlink("/e") == 0);
 	REQUIRE(get_cached("/f", &st) == 0);
 	CHECK(st.st_nlink == 1 && st.st_ino == ino && st.st_size == 1);
+
+	/* a link to a symlink reads back the same target */
+	mk_link("/s", "target");
+	CHECK(ops->link("/s", "/t") == 0);
+	CHECK(ops->readlink("/t", buf, sizeof(buf)) == 0);
+	CHECK(strcmp(buf, "target") == 0);
 }
 
 static void test_cache_invalidate(void)
