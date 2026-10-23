@@ -606,6 +606,29 @@ static int t_test_waiting_sender_gives_up_with_its_connection(void)
 	return 0;
 }
 
+/* A read request that failed is an error for the reader, not end of file */
+static int t_test_failed_read_is_an_error(void)
+{
+	struct read_chunk *chunk = g_new0(struct read_chunk, 1);
+	struct read_req *rreq = g_new0(struct read_req, 1);
+	char buf[16];
+
+	list_init(&chunk->reqs);
+	pthread_cond_init(&chunk->sio.finished, NULL);
+	chunk->refs = 1;
+	chunk->size = sizeof(buf);
+	rreq->sio = &chunk->sio;
+	rreq->size = sizeof(buf);
+	rreq->res = -EIO;
+	buf_init(&rreq->data, 0);
+	list_add(&rreq->list, &chunk->reqs);
+
+	/* wait_chunk() frees the chunk and the request */
+	if (wait_chunk(chunk, buf, sizeof(buf)) != -EIO)
+		return t_fail("a failed read was not reported as an error");
+	return 0;
+}
+
 /*
  * The connection drops, and another one is set up, after a request has been
  * checked against the old one but before it is written. Its handle means
@@ -651,6 +674,8 @@ static int t_test_stale_request_not_sent_to_new_session(void)
 	}
 	pthread_mutex_unlock(&conn->lock_write);
 	pthread_join(thread, NULL);
+	if (job.res != -EIO)
+		return t_fail("the request for the old session was not refused");
 
 	/* The answer to this arrives after everything written before it */
 	if (t_stat(conn) != -ENOENT)
@@ -788,6 +813,8 @@ int main(void)
 	if (t_test_blocked_writer_is_released() != 0)
 		return 1;
 	if (t_test_dup_failure_is_refunded() != 0)
+		return 1;
+	if (t_test_failed_read_is_an_error() != 0)
 		return 1;
 
 	return 0;
