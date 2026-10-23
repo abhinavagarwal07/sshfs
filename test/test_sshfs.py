@@ -27,6 +27,10 @@ from util import (
     safe_sleep,
     os_create,
     os_open,
+    SSH_LOCALHOST,
+    _check_ssh_localhost,
+    _mount_sshfs,
+    mounted,
 )
 from os.path import join as pjoin
 
@@ -755,60 +759,6 @@ def tst_passthrough(src_dir, mnt_dir, cache_timeout):
     assert abs(src_st.st_mtime - mnt_st.st_mtime) <= 1
 
 
-SSH_LOCALHOST = [
-    "ssh", "-o", "StrictHostKeyChecking=no",
-    "-o", "KbdInteractiveAuthentication=no",
-    "-o", "ChallengeResponseAuthentication=no",
-    "-o", "PasswordAuthentication=no",
-    "localhost", "--",
-]
-
-
-def _check_ssh_localhost():
-    try:
-        res = subprocess.call(
-            SSH_LOCALHOST + ["true"], stdin=subprocess.DEVNULL, timeout=10
-        )
-    except subprocess.TimeoutExpired:
-        res = 1
-    if res != 0:
-        pytest.fail("Unable to ssh into localhost without password prompt.")
-
-
-_mount_ctr = [0]
-
-
-def _mount_sshfs(tmpdir, extra_opts=None):
-    """Helper to mount sshfs with custom options. Returns (mount_process, mnt_dir, src_dir)."""
-    _check_ssh_localhost()
-    _mount_ctr[0] += 1
-    mnt_dir = str(tmpdir.mkdir(f"mnt{_mount_ctr[0]}"))
-    src_dir = str(tmpdir.mkdir(f"src{_mount_ctr[0]}"))
-
-    cmdline = base_cmdline + [
-        pjoin(basename, "sshfs"),
-        "-f",
-        f"localhost:{src_dir}",
-        mnt_dir,
-        "-o", "entry_timeout=0",
-        "-o", "attr_timeout=0",
-    ]
-    if extra_opts:
-        for opt in extra_opts:
-            cmdline += ["-o", opt]
-
-    new_env = dict(os.environ)
-    new_env["G_DEBUG"] = "fatal-warnings"
-
-    mount_process = subprocess.Popen(cmdline, env=new_env)
-    try:
-        wait_for_mount(mount_process, mnt_dir)
-    except:
-        cleanup(mount_process, mnt_dir)
-        raise
-    return mount_process, mnt_dir, src_dir
-
-
 def test_chown_group(tmpdir, capfd):
     capfd.register_output(r"^Warning: Permanently added 'localhost' .+", count=0)
 
@@ -909,8 +859,7 @@ def test_disable_hardlink(tmpdir, capfd):
 
 def test_follow_symlinks(tmpdir, capfd):
     capfd.register_output(r"^Warning: Permanently added 'localhost' .+", count=0)
-    mount_process, mnt_dir, src_dir = _mount_sshfs(tmpdir, ["follow_symlinks"])
-    try:
+    with mounted(tmpdir, ["follow_symlinks"]) as (mnt_dir, src_dir):
         target_name = name_generator()
         target = pjoin(src_dir, target_name)
         with open(target, "wb") as fh:
@@ -929,17 +878,11 @@ def test_follow_symlinks(tmpdir, capfd):
 
         os.unlink(link)
         os.unlink(target)
-    except Exception:
-        cleanup(mount_process, mnt_dir)
-        raise
-    else:
-        umount(mount_process, mnt_dir)
 
 
 def test_direct_io(tmpdir, capfd):
     capfd.register_output(r"^Warning: Permanently added 'localhost' .+", count=0)
-    mount_process, mnt_dir, src_dir = _mount_sshfs(tmpdir, ["direct_io"])
-    try:
+    with mounted(tmpdir, ["direct_io"]) as (mnt_dir, src_dir):
         name = name_generator()
         mnt_name = pjoin(mnt_dir, name)
         src_name = pjoin(src_dir, name)
@@ -953,11 +896,6 @@ def test_direct_io(tmpdir, capfd):
             assert fh.read() == data
 
         os.unlink(mnt_name)
-    except Exception:
-        cleanup(mount_process, mnt_dir)
-        raise
-    else:
-        umount(mount_process, mnt_dir)
 
 
 def test_bad_sftp_reply_len(tmpdir):
