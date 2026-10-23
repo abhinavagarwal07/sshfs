@@ -247,6 +247,7 @@ struct dir_handle {
 	 * https://github.com/libfuse/sshfs/issues/338
 	 */
 	GPtrArray *entries;	/* array of struct dir_entry * */
+	char *handle_path;	/* path used to open the current SFTP handle */
 	int read_err;		/* error from the last read, if any */
 	int has_handle;		/* buf holds an open SFTP dir handle to close */
 	int buf_exhausted;	/* the SFTP handle has been read to EOF */
@@ -2446,6 +2447,7 @@ static int sshfs_opendir(const char *path, struct fuse_file_info *fi)
 		handle->conn->dir_count++;
 		pthread_mutex_unlock(&sshfs.lock);
 		handle->has_handle = 1;
+		handle->handle_path = g_strdup(path);
 		fi->fh = (unsigned long) handle;
 	} else
 		g_free(handle);
@@ -2485,6 +2487,8 @@ static int sshfs_reopen_dir(struct dir_handle *handle, const char *path)
 		buf_finish(&handle->buf);
 		handle->has_handle = 1;
 		handle->buf_exhausted = 0;
+		g_free(handle->handle_path);
+		handle->handle_path = g_strdup(path);
 	}
 	return err;
 }
@@ -2511,10 +2515,15 @@ static int sshfs_readdir(const char *path, void *dbuf, fuse_fill_dir_t filler,
 	 */
 	/* FUSE can still pass NULL for an unlinked directory. In that case
 	   keep the snapshot: reopening the former path could read a different
-	   directory that has since been created there. An unread SFTP handle
-	   can still be enumerated without a path. */
+	   directory that has since been created there. SSHFS can submit READDIR
+	   on an unread SFTP handle without a local path. */
 	if (handle->entries == NULL || (offset == 0 && path != NULL)) {
-		if (handle->buf_exhausted)
+		/* OpenSSH also uses the OPENDIR path while processing READDIR.
+		   Reopen an unread handle if FUSE reports that it has moved. */
+		if (path != NULL &&
+		    (handle->buf_exhausted || !handle->has_handle ||
+		     handle->handle_path == NULL ||
+		     strcmp(path, handle->handle_path) != 0))
 			handle->read_err = sshfs_reopen_dir(handle, path);
 		if (!handle->read_err) {
 			if (handle->entries)
@@ -2566,6 +2575,7 @@ static int sshfs_releasedir(const char *path, struct fuse_file_info *fi)
 	pthread_mutex_unlock(&sshfs.lock);
 	if (handle->entries)
 		g_ptr_array_free(handle->entries, TRUE);
+	g_free(handle->handle_path);
 	g_free(handle);
 	return err;
 }

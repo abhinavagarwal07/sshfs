@@ -385,6 +385,18 @@ static int cache_readdir(const char *path, void *buf, fuse_fill_dir_t filler,
 	GPtrArray *dir;
 	struct node *node;
 	struct cache_dirent **cdent;
+	cfi = (struct file_handle*) fi->fh;
+
+	/* An unlinked directory has no cache key. If the lower filesystem was
+	 * opened, let it replay its per-handle snapshot without touching the
+	 * path cache. A stream served only from this cache has no lower state. */
+	if (path == NULL) {
+		if (!cfi->is_open)
+			return -ESTALE;
+		fi->fh = cfi->fs_fh;
+		return cache.next_oper->readdir(NULL, buf, filler, offset, fi,
+						 flags);
+	}
 
 	/*
 	 * sshfs uses mode-1 readdir: the offset parameter is ignored and the
@@ -413,7 +425,6 @@ static int cache_readdir(const char *path, void *buf, fuse_fill_dir_t filler,
 	}
 	pthread_mutex_unlock(&cache.lock);
 
-	cfi = (struct file_handle*) fi->fh;
 	if(cfi->is_open)
 		fi->fh = cfi->fs_fh;
 	else {
