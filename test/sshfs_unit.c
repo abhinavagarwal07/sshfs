@@ -515,6 +515,13 @@ static int t_test_waiting_senders_are_not_stranded(void)
 		}
 	}
 
+	/* Only the first request is in the table, and the only one counted */
+	n = 1;
+	if (t_outstanding_len() != t_wire_len(pathlen[0]) ||
+	    !t_reqtab_size_is(&n))
+		return t_fail("requests that wait for room were counted or "
+			      "sent");
+
 	if (t_session_drop(conn, &ra) == -1)
 		return t_fail("session was not torn down");
 	for (i = 0; i < 3; i++) {
@@ -572,9 +579,14 @@ static int t_test_waiting_sender_gives_up_with_its_connection(void)
 	if (waiter.res != -EIO)
 		return t_fail("waiting request did not fail with its "
 			      "connection");
+	if (t_outstanding_len() != t_wire_len(67))
+		return t_fail("the lost connection changed the count of "
+			      "another one");
 
 	t_responder_hold(&rb, 0);
 	pthread_join(tother, NULL);
+	if (other.res != -ENOENT)
+		return t_fail("the other request did not get its answer");
 	if (t_session_drop(&sshfs.conns[1], &rb) == -1)
 		return t_fail("connection 1 was not torn down");
 	sshfs.max_outstanding_len = ~0U;
