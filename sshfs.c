@@ -3825,29 +3825,28 @@ static int sshfs_getattr(const char *path, struct stat *stbuf,
 			 struct fuse_file_info *fi)
 {
 	int err;
+	uint8_t type;
 	struct buffer buf;
 	struct buffer outbuf;
 	struct sshfs_file *sf = NULL;
 
-	if (fi != NULL && !sshfs.fstat_workaround) {
+	if (fi != NULL) {
 		sf = get_sshfs_file(fi);
 		if (!sshfs_file_is_conn(sf))
 			return -EIO;
 	}
 
 	buf_init(&buf, 0);
-	if(sf == NULL) {
+	if (sf == NULL || sshfs.fstat_workaround) {
 		buf_add_path(&buf, path);
-		err = sftp_request(get_conn(sf, path),
-				   sshfs.follow_symlinks ? SSH_FXP_STAT : SSH_FXP_LSTAT,
-				   &buf, SSH_FXP_ATTRS, &outbuf);
-	}
-	else {
+		type = sshfs.follow_symlinks ? SSH_FXP_STAT : SSH_FXP_LSTAT;
+	} else {
 		buf_add_buf(&buf, &sf->handle);
-		err = sftp_request_connver(sf->conn, sf->connver,
-					   SSH_FXP_FSTAT, &buf,
-					   SSH_FXP_ATTRS, &outbuf);
+		type = SSH_FXP_FSTAT;
 	}
+	err = sftp_request_connver(get_conn(sf, path),
+				   sf ? sf->connver : CONNVER_ANY, type,
+				   &buf, SSH_FXP_ATTRS, &outbuf);
 	if (!err) {
 		err = buf_get_attrs(&outbuf, stbuf, NULL);
 #ifdef __APPLE__

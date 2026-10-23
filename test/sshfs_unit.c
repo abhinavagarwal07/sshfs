@@ -780,12 +780,64 @@ static int t_test_dup_failure_is_refunded(void)
 	return 0;
 }
 
+/* The fstat workaround may use a path, but still belongs to the open file's
+   session. A replacement file after reconnect must not supply its metadata. */
+static int t_test_fstat_workaround_keeps_session(void)
+{
+	struct conn *conn = &sshfs.conns[0];
+	struct t_responder ra;
+	struct t_responder rb;
+	struct sshfs_file sf = { .conn = conn };
+	struct fuse_file_info fi = { .fh = (unsigned long) &sf };
+	struct stat stbuf;
+	int follow;
+
+	t_responder_init(&ra);
+	t_responder_init(&rb);
+	if (t_session_start(conn, &ra) == -1)
+		return t_fail("could not start the session");
+	sf.connver = t_connver(conn);
+	sshfs.fstat_workaround = 1;
+	for (follow = 0; follow <= 1; follow++) {
+		sshfs.follow_symlinks = follow;
+		if (sshfs_getattr("/file", &stbuf, &fi) != -ENOENT)
+			return t_fail("current file's path lookup did not get its reply");
+	}
+	if (t_responder_seen(&ra, SSH_FXP_STAT) != 1 ||
+	    t_responder_seen(&ra, SSH_FXP_LSTAT) != 1 ||
+	    t_responder_seen(&ra, SSH_FXP_FSTAT) != 0)
+		return t_fail("fstat workaround did not use path lookups");
+	if (t_session_drop(conn, &ra) == -1 ||
+	    t_session_start(conn, &rb) == -1)
+		return t_fail("could not replace the session");
+	for (follow = 0; follow <= 1; follow++) {
+		sshfs.follow_symlinks = follow;
+		if (sshfs_getattr("/file", &stbuf, &fi) != -EIO)
+			return t_fail("stale file used the fstat workaround");
+	}
+	if (t_responder_seen(&rb, SSH_FXP_STAT) != 0 ||
+	    t_responder_seen(&rb, SSH_FXP_LSTAT) != 0)
+		return t_fail("stale file's path lookup reached the new session");
+	/* A reopened file can use the workaround on the replacement session. */
+	sf.connver = t_connver(conn);
+	if (sshfs_getattr("/file", &stbuf, &fi) != -ENOENT ||
+	    t_responder_seen(&rb, SSH_FXP_STAT) != 1)
+		return t_fail("reopened file could not use the fstat workaround");
+	sshfs.follow_symlinks = 0;
+	sshfs.fstat_workaround = 0;
+	if (t_session_drop(conn, &rb) == -1 || !t_idle())
+		return t_fail("requests left behind");
+	return 0;
+}
+
 int main(void)
 {
 	int i;
+	static char base_path[] = "";
 
 	alarm(T_TIMEOUT_SECS);
 
+	sshfs.base_path = base_path;
 	sshfs.max_conns = T_MAX_CONNS;
 	sshfs.conns = g_new0(struct conn, T_MAX_CONNS);
 	for (i = 0; i < T_MAX_CONNS; i++) {
@@ -815,6 +867,8 @@ int main(void)
 	if (t_test_dup_failure_is_refunded() != 0)
 		return 1;
 	if (t_test_failed_read_is_an_error() != 0)
+		return 1;
+	if (t_test_fstat_workaround_keeps_session() != 0)
 		return 1;
 
 	return 0;
