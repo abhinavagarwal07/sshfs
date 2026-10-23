@@ -65,16 +65,22 @@ def wait_for_mount(mount_process, mnt_dir, test_fn=os.path.ismount):
 
 
 def cleanup(mount_process, mnt_dir):
-    subprocess.call(
-        [FUSERMOUNT_BIN, "-z", "-u", mnt_dir],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.STDOUT,
-    )
-    mount_process.terminate()
     try:
-        mount_process.wait(1)
+        subprocess.call(
+            [FUSERMOUNT_BIN, "-z", "-u", mnt_dir],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.STDOUT,
+            timeout=10,
+        )
     except subprocess.TimeoutExpired:
-        mount_process.kill()
+        pass
+    finally:
+        mount_process.terminate()
+        try:
+            mount_process.wait(1)
+        except subprocess.TimeoutExpired:
+            mount_process.kill()
+            mount_process.wait()
 
 
 def umount(mount_process, mnt_dir):
