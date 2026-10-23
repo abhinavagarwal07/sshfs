@@ -9,15 +9,78 @@
  * sshfs.c.  Failures are reported on stderr and make the test exit non-zero.
  */
 
-/* sshfs.c sets _GNU_SOURCE, so it has to come before any other header */
+#define _GNU_SOURCE
+#include <glib.h>
+#include <pthread.h>
+#include <stdint.h>
+
+static gboolean t_hash_table_remove(GHashTable *table, gconstpointer key);
+static int t_mutex_unlock(pthread_mutex_t *mutex);
+
 #ifdef __APPLE__
 int sshfs_main(int argc, char *argv[], char *envp[], char **exec_path);
 #else
 int sshfs_main(int argc, char *argv[]);
 #endif
 #define main sshfs_main
+#define g_hash_table_remove t_hash_table_remove
+#define pthread_mutex_unlock t_mutex_unlock
 #include "../sshfs.c"
+#undef pthread_mutex_unlock
+#undef g_hash_table_remove
 #undef main
+
+/* Pause the reader just after it releases the table lock for one reply. This
+   lets a failed sender finish while the reader is still on that stack frame. */
+static struct {
+	pthread_mutex_t lock;
+	pthread_cond_t cond;
+	uint32_t id;
+	pthread_t reader;
+	int armed;
+	int removed;
+	int paused;
+	int released;
+} t_reply_gate = { .lock = PTHREAD_MUTEX_INITIALIZER,
+		   .cond = PTHREAD_COND_INITIALIZER };
+
+static gboolean t_hash_table_remove(GHashTable *table, gconstpointer key)
+{
+	gboolean removed = g_hash_table_remove(table, key);
+
+	pthread_mutex_lock(&t_reply_gate.lock);
+	if (removed && table == sshfs.reqtab && t_reply_gate.armed &&
+	    GPOINTER_TO_UINT(key) == t_reply_gate.id) {
+		t_reply_gate.reader = pthread_self();
+		t_reply_gate.removed = 1;
+	}
+	pthread_mutex_unlock(&t_reply_gate.lock);
+	return removed;
+}
+
+static int t_mutex_unlock(pthread_mutex_t *mutex)
+{
+	int pause;
+	int res;
+
+	pthread_mutex_lock(&t_reply_gate.lock);
+	pause = mutex == &sshfs.lock && t_reply_gate.armed &&
+		t_reply_gate.removed &&
+		pthread_equal(pthread_self(), t_reply_gate.reader);
+	if (pause)
+		t_reply_gate.armed = 0;
+	pthread_mutex_unlock(&t_reply_gate.lock);
+	res = pthread_mutex_unlock(mutex);
+	if (pause) {
+		pthread_mutex_lock(&t_reply_gate.lock);
+		t_reply_gate.paused = 1;
+		pthread_cond_broadcast(&t_reply_gate.cond);
+		while (!t_reply_gate.released)
+			pthread_cond_wait(&t_reply_gate.cond, &t_reply_gate.lock);
+		pthread_mutex_unlock(&t_reply_gate.lock);
+	}
+	return res;
+}
 
 #define T_MAX_CONNS 2
 #define T_MAX_SEEN 32
@@ -561,6 +624,89 @@ static int t_test_waiting_sender_gives_up_with_its_connection(void)
 	return 0;
 }
 
+static void t_record_completed_reply(struct request *req)
+{
+	int *replied = req->data;
+
+	*replied = req->replied;
+}
+
+static void *t_failed_reply_sender(void *data)
+{
+	struct buffer buf;
+	struct iovec iov;
+	struct request *req;
+
+	buf_init(&buf, 0);
+	buf_add_string(&buf, "file");
+	buf_to_iov(&buf, &iov);
+	sftp_request_send(&sshfs.conns[0], SSH_FXP_STAT, &iov, 1, NULL,
+			  t_record_completed_reply, 1, data, &req);
+	sftp_request_wait(req, SSH_FXP_STAT, SSH_FXP_ATTRS, NULL);
+	buf_free(&buf);
+	return NULL;
+}
+
+static int t_reader_paused(void *arg)
+{
+	int paused;
+
+	(void) arg;
+	pthread_mutex_lock(&t_reply_gate.lock);
+	paused = t_reply_gate.paused;
+	pthread_mutex_unlock(&t_reply_gate.lock);
+	return paused;
+}
+
+/* A reply and a failed write can race. A sender that finds its request already
+   removed must not free it while the reader is still completing the reply. */
+static int t_test_failed_sender_waits_for_reply_completion(void)
+{
+	struct conn *conn = &sshfs.conns[0];
+	struct t_responder ra;
+	pthread_t thread;
+	GHashTableIter iter;
+	gpointer key;
+	unsigned n = 1;
+	uint32_t id;
+	int replied = -1;
+
+	t_responder_init(&ra);
+	if (t_session_start(conn, &ra) == -1)
+		return t_fail("could not start the session");
+	pthread_mutex_lock(&conn->lock_write);
+	if (pthread_create(&thread, NULL, t_failed_reply_sender, &replied) != 0)
+		return t_fail("pthread_create failed");
+	if (t_wait_until(t_reqtab_size_is, &n) == -1)
+		return t_fail("request was not queued");
+	pthread_mutex_lock(&sshfs.lock);
+	g_hash_table_iter_init(&iter, sshfs.reqtab);
+	g_hash_table_iter_next(&iter, &key, NULL);
+	id = GPOINTER_TO_UINT(key);
+	pthread_mutex_lock(&t_reply_gate.lock);
+	t_reply_gate.id = id;
+	t_reply_gate.armed = 1;
+	pthread_mutex_unlock(&t_reply_gate.lock);
+	pthread_mutex_unlock(&sshfs.lock);
+
+	/* Inject the reply before letting the queued write fail. */
+	t_reply_status(ra.fd, id);
+	if (t_wait_until(t_reader_paused, NULL) == -1)
+		return t_fail("reader did not process the reply");
+	shutdown(conn->wfd, SHUT_WR);
+	pthread_mutex_unlock(&conn->lock_write);
+	pthread_join(thread, NULL);
+	if (replied != 1)
+		return t_fail("sender freed the request before its reply was complete");
+	pthread_mutex_lock(&t_reply_gate.lock);
+	t_reply_gate.released = 1;
+	pthread_cond_broadcast(&t_reply_gate.cond);
+	pthread_mutex_unlock(&t_reply_gate.lock);
+	if (t_session_drop(conn, &ra) == -1 || !t_idle())
+		return t_fail("requests left behind");
+	return 0;
+}
+
 int main(void)
 {
 	int i;
@@ -588,6 +734,8 @@ int main(void)
 	if (t_test_waiting_senders_are_not_stranded() != 0)
 		return 1;
 	if (t_test_waiting_sender_gives_up_with_its_connection() != 0)
+		return 1;
+	if (t_test_failed_sender_waits_for_reply_completion() != 0)
 		return 1;
 
 	return 0;
