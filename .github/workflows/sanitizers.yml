@@ -13,6 +13,10 @@ on:
 permissions:
   contents: read
 
+# dispatch runs may build other refs, whose build code can reach the cache
+# credentials of later action steps, so don't let them save caches
+cache-mode: read
+
 concurrency:
   # dispatch runs get their own group so they can't cancel (or be cancelled by)
   # the run for the branch they were started from

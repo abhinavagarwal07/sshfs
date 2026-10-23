@@ -13,7 +13,8 @@ on:
 permissions:
   contents: read
 
-# the FreeBSD VM action saves a cache, and dispatch runs may build other refs
+# dispatch runs may build other refs, whose build code can reach the cache
+# credentials of later action steps, so don't let them save caches
 cache-mode: read
 
 concurrency:
