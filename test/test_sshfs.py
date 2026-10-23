@@ -755,15 +755,19 @@ def tst_passthrough(src_dir, mnt_dir, cache_timeout):
     assert abs(src_st.st_mtime - mnt_st.st_mtime) <= 1
 
 
+SSH_LOCALHOST = [
+    "ssh", "-o", "StrictHostKeyChecking=no",
+    "-o", "KbdInteractiveAuthentication=no",
+    "-o", "ChallengeResponseAuthentication=no",
+    "-o", "PasswordAuthentication=no",
+    "localhost", "--",
+]
+
+
 def _check_ssh_localhost():
     try:
         res = subprocess.call(
-            ["ssh", "-o", "StrictHostKeyChecking=no",
-             "-o", "KbdInteractiveAuthentication=no",
-             "-o", "ChallengeResponseAuthentication=no",
-             "-o", "PasswordAuthentication=no",
-             "localhost", "--", "true"],
-            stdin=subprocess.DEVNULL, timeout=10,
+            SSH_LOCALHOST + ["true"], stdin=subprocess.DEVNULL, timeout=10
         )
     except subprocess.TimeoutExpired:
         res = 1
@@ -810,11 +814,18 @@ def test_chown_group(tmpdir, capfd):
 
     # The owner of a file may chgrp it to any group they are a member of.
     # Without a second group there is nothing to test; CI must not lose the
-    # test that way, so it fails there. The new directory may inherit any of
-    # the groups (setgid parent), so pick the target after creating it.
-    groups = list(dict.fromkeys([os.getgid(), *os.getgroups()]))
-    if os.getuid() == 0 and len(groups) < 2:
-        groups.append(os.getgid() + 1)
+    # test that way, so it fails there. The chgrp is done by the SFTP server,
+    # so only use groups its session has too, and pick the target after
+    # creating the directory, which may inherit a group from a setgid parent.
+    _check_ssh_localhost()
+    server_groups = subprocess.check_output(
+        SSH_LOCALHOST + ["id", "-G"],
+        stdin=subprocess.DEVNULL, timeout=10, universal_newlines=True,
+    ).split()
+    groups = [
+        g for g in dict.fromkeys([os.getgid(), *os.getgroups()])
+        if str(g) in server_groups
+    ]
     if len(groups) < 2:
         reason = "user has no second group to chgrp to"
         if require_fuse():
