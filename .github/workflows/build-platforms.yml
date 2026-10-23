@@ -198,7 +198,9 @@ jobs:
           IMAGE: ${{ matrix.image }}
           DNF_ARGS: ${{ matrix.dnf_args }}
         run: |
-          docker run --rm --privileged --device /dev/fuse -e DNF_ARGS \
+          # FUSE mounts need CAP_SYS_ADMIN and no AppArmor profile, not --privileged
+          docker run --rm --cap-add SYS_ADMIN --security-opt apparmor=unconfined \
+            --device /dev/fuse -e DNF_ARGS \
             -v "$PWD:/work" -w /work "$IMAGE" sh -euxc '
             # which: test/util.py runs it, and the Fedora image does not ship it
             dnf install -y $DNF_ARGS gcc meson ninja-build pkg-config glib2-devel fuse3-devel \
@@ -230,20 +232,27 @@ jobs:
           '
 
       # A missing FUSE prerequisite makes the mount tests skip, not fail.
-      - name: Check tests ran and none were skipped
+      - name: Check mount tests ran and none were skipped
         run: |
           python3 - build-rpm/test-results.xml <<'EOF'
           import sys
           import xml.etree.ElementTree as ET
           root = ET.parse(sys.argv[1]).getroot()
-          ran = sum(c.find("skipped") is None for c in root.iter("testcase"))
+          ran = sum(
+              c.get("classname", "").endswith("test_sshfs") and c.find("skipped") is None
+              for c in root.iter("testcase")
+          )
           # xfail is reported as skipped too, but it is not a missing prerequisite
           skipped = sum(1 for s in root.iter("skipped") if s.get("type") != "pytest.xfail")
-          print(f"{ran} tests ran, {skipped} skipped")
+          print(f"{ran} mount tests ran, {skipped} skipped")
           if ran == 0 or skipped:
-              print(f"::error::{ran} tests ran, {skipped} skipped")
+              print(f"::error::{ran} mount tests ran, {skipped} skipped")
               sys.exit(1)
           EOF
+
+      - name: Note advisory failure
+        if: failure()
+        run: echo "::warning::${{ matrix.name }} runtime tests failed (advisory, not blocking)"
 
       - name: Upload test results
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
