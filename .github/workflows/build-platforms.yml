@@ -238,8 +238,9 @@ jobs:
           import sys
           import xml.etree.ElementTree as ET
           root = ET.parse(sys.argv[1]).getroot()
+          # test_sshfs[...] mounts; the hostname and bad-reply tests pass without FUSE
           ran = sum(
-              c.get("classname", "").endswith("test_sshfs") and c.find("skipped") is None
+              c.get("name", "").startswith("test_sshfs[") and c.find("skipped") is None
               for c in root.iter("testcase")
           )
           # xfail is reported as skipped too, but it is not a missing prerequisite
