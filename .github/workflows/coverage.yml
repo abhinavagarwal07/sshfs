@@ -1,0 +1,149 @@
+name: coverage
+on:
+  push:
+    branches: [master]
+
+  # only to try changes to this workflow
+  pull_request:
+    paths: ['.github/workflows/coverage.yml']
+
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # Report only: no threshold, and nothing is uploaded to an outside service.
+  coverage:
+    name: gcc / coverage
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.12'
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc ninja-build pkg-config libglib2.0-dev libfuse3-dev openssh-server openssh-client fuse3
+
+      - name: Install meson, pytest and gcovr
+        run: pip3 install meson==1.12.1 pytest==9.1.1 pytest-timeout==2.4.0 gcovr==8.7
+
+      - name: Setup SSH
+        run: |
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+          ssh-keygen -t ed25519 -f ~/.ssh/id_ed25519 -q -N ""
+          cat ~/.ssh/id_ed25519.pub > ~/.ssh/authorized_keys
+          chmod 600 ~/.ssh/authorized_keys
+          sudo systemctl start ssh || sudo service ssh start
+          ssh -o StrictHostKeyChecking=no -o BatchMode=yes localhost true
+
+      - name: Check FUSE availability
+        run: |
+          test -e /dev/fuse
+          command -v fusermount3
+
+      - name: Build with coverage
+        env:
+          CC: gcc
+        run: |
+          meson setup build -Db_coverage=true --buildtype=debug
+          ninja -C build
+
+      - name: Run tests
+        id: tests
+        timeout-minutes: 20
+        run: |
+          cd build
+          python3 -m pytest --maxfail=99 --timeout=300 --junitxml=test-results.xml test/
+
+      # The mount tests skip when FUSE is unusable, and then the numbers mean
+      # nothing. xfails are recorded as skips in the XML but are fine.
+      - name: Check that the mount tests ran
+        id: test_check
+        run: |
+          python3 - build/test-results.xml <<'PY'
+          import sys
+          import xml.etree.ElementTree as ET
+
+          root = ET.parse(sys.argv[1]).getroot()
+          cases = list(root.iter("testcase"))
+          skipped = [
+              c.get("name")
+              for c in cases
+              if c.find("skipped") is not None
+              and c.find("skipped").get("type") != "pytest.xfail"
+          ]
+          mounted = [
+              c
+              for c in cases
+              if c.get("name", "").startswith("test_sshfs[")
+              and not any(c.find(t) is not None for t in ("failure", "error", "skipped"))
+          ]
+          if not mounted:
+              sys.exit("::error::no mount test ran")
+          if skipped:
+              sys.exit(f"::error::{len(skipped)} test(s) were skipped: {', '.join(skipped)}")
+          PY
+
+      # gcov data is written when sshfs exits normally. A mount that
+      # util.cleanup() has to SIGKILL loses its .gcda data.
+      - name: Coverage report
+        if: ${{ !cancelled() && steps.tests.outcome != 'skipped' }}
+        env:
+          TESTS_OUTCOME: ${{ steps.tests.outcome }}
+          TEST_CHECK_OUTCOME: ${{ steps.test_check.outcome }}
+        run: |
+          for src in sshfs.c cache.c; do
+            if [ ! -s "build/sshfs.p/$src.gcda" ]; then
+              echo "::warning::no runtime coverage data for $src"
+              echo "Coverage unavailable: build/sshfs.p/$src.gcda is missing." >> "$GITHUB_STEP_SUMMARY"
+              exit 1
+            fi
+          done
+          mkdir -p coverage
+          gcovr --root . --filter '^sshfs\.c$' --filter '^cache\.c$' \
+                --print-summary --json-summary coverage/summary.json \
+                --html-details coverage/index.html build/sshfs.p
+          {
+            echo '### Coverage of sshfs.c and cache.c'
+            echo
+            if [ "$TESTS_OUTCOME" != success ] || [ "$TEST_CHECK_OUTCOME" != success ]; then
+              echo "**The tests did not all pass, so these numbers are partial.**"
+              echo
+            fi
+            jq -r '
+              def pct(p): if p == null then "-" else "\(p)%" end;
+              def cell(p; c; t): "\(pct(p)) (\(c)/\(t))";
+              def row(name; o): "| \(name) | \(cell(o.line_percent; o.line_covered; o.line_total)) | \(cell(o.function_percent; o.function_covered; o.function_total)) | \(cell(o.branch_percent; o.branch_covered; o.branch_total)) |";
+              "| file | lines | functions | branches |",
+              "|---|---|---|---|",
+              (.files[] | row(.filename; .)),
+              row("total"; .)' coverage/summary.json
+            echo
+            echo 'Report only, there is no threshold. Mounts that the tests have to SIGKILL do not write their coverage data, so they are not counted. The HTML report is in the coverage-html artifact.'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload report and test results
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: ${{ !cancelled() }}
+        with:
+          name: coverage-html
+          path: |
+            coverage/
+            build/test-results.xml
+          retention-days: 14
+          if-no-files-found: warn
