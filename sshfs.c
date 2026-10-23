@@ -247,6 +247,7 @@ struct dir_handle {
 	 * https://github.com/libfuse/sshfs/issues/338
 	 */
 	GPtrArray *entries;	/* array of struct dir_entry * */
+	char *path;		/* directory path, for reopening the handle */
 	int read_err;		/* error from the last read, if any */
 	int has_handle;		/* buf holds an open SFTP dir handle to close */
 	int buf_exhausted;	/* the SFTP handle has been read to EOF */
@@ -1988,9 +1989,12 @@ static void *sshfs_init(struct fuse_conn_info *conn,
 	if (conn->capable & FUSE_CAP_ASYNC_READ)
 		sshfs.sync_read = 1;
 
-	/* Rewinding a directory needs its current path to reopen the SFTP
-	   handle, including after a rename through this mount. */
-	cfg->nullpath_ok = 0;
+	// These workarounds require the "path" argument.
+	cfg->nullpath_ok = !(sshfs.truncate_workaround || sshfs.fstat_workaround);
+
+	// When using multiple connections, release() needs to know the path
+	if (sshfs.max_conns > 1)
+		cfg->nullpath_ok = 0;
 
 	// Lookup of . and .. is supported
 	conn->capable |= FUSE_CAP_EXPORT_SUPPORT;
@@ -2446,6 +2450,7 @@ static int sshfs_opendir(const char *path, struct fuse_file_info *fi)
 		handle->conn->dir_count++;
 		pthread_mutex_unlock(&sshfs.lock);
 		handle->has_handle = 1;
+		handle->path = g_strdup(path);
 		fi->fh = (unsigned long) handle;
 	} else
 		g_free(handle);
@@ -2465,7 +2470,7 @@ static void free_dir_entry(gpointer data)
  * directory from the start means closing the exhausted handle and opening a
  * fresh one.
  */
-static int sshfs_reopen_dir(struct dir_handle *handle, const char *path)
+static int sshfs_reopen_dir(struct dir_handle *handle)
 {
 	struct buffer buf;
 	int err;
@@ -2477,7 +2482,7 @@ static int sshfs_reopen_dir(struct dir_handle *handle, const char *path)
 		handle->has_handle = 0;
 	}
 	buf_init(&buf, 0);
-	buf_add_path(&buf, path);
+	buf_add_path(&buf, handle->path);
 	err = sftp_request(handle->conn, SSH_FXP_OPENDIR, &buf,
 			   SSH_FXP_HANDLE, &handle->buf);
 	buf_free(&buf);
@@ -2493,7 +2498,7 @@ static int sshfs_readdir(const char *path, void *dbuf, fuse_fill_dir_t filler,
 			 off_t offset, struct fuse_file_info *fi,
 			 enum fuse_readdir_flags flags)
 {
-	(void) flags;
+	(void) path; (void) flags;
 	unsigned i;
 	struct dir_handle *handle;
 
@@ -2509,13 +2514,9 @@ static int sshfs_readdir(const char *path, void *dbuf, fuse_fill_dir_t filler,
 	 * snapshot taken at offset 0.
 	 * See: https://github.com/libfuse/sshfs/issues/338
 	 */
-	/* FUSE can still pass NULL for an unlinked directory. In that case
-	   keep the snapshot: reopening the former path could read a different
-	   directory that has since been created there. An unread SFTP handle
-	   can still be enumerated without a path. */
-	if (handle->entries == NULL || (offset == 0 && path != NULL)) {
+	if (offset == 0 || handle->entries == NULL) {
 		if (handle->buf_exhausted)
-			handle->read_err = sshfs_reopen_dir(handle, path);
+			handle->read_err = sshfs_reopen_dir(handle);
 		if (!handle->read_err) {
 			if (handle->entries)
 				g_ptr_array_free(handle->entries, TRUE);
@@ -2566,6 +2567,7 @@ static int sshfs_releasedir(const char *path, struct fuse_file_info *fi)
 	pthread_mutex_unlock(&sshfs.lock);
 	if (handle->entries)
 		g_ptr_array_free(handle->entries, TRUE);
+	g_free(handle->path);
 	g_free(handle);
 	return err;
 }
