@@ -455,12 +455,23 @@ static int t_test_failed_send_is_refunded(void)
 		pthread_mutex_unlock(&conn->lock_write);
 		return t_fail("request was not queued");
 	}
+	if (t_outstanding_len() != t_wire_len(10)) {
+		pthread_mutex_unlock(&conn->lock_write);
+		return t_fail("request was not counted");
+	}
 
-	/* Writes fail from now on, but the reader keeps waiting */
+	/*
+	 * Writes fail from now on. The responder does not close its end when
+	 * it sees this, so the reader keeps waiting and cannot clean up first:
+	 * the sender is the one that has to give the request back.
+	 */
 	shutdown(conn->wfd, SHUT_WR);
 	pthread_mutex_unlock(&conn->lock_write);
 	pthread_join(thread, NULL);
 
+	if (t_session_wait_dead(conn))
+		return t_fail("the connection was torn down, not the send "
+			      "failed");
 	if (job.res != -EIO)
 		return t_fail("failed send was not reported");
 	if (!t_idle())
