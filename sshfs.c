@@ -1616,7 +1616,6 @@ static int process_one_request(struct conn *conn)
 		subtract_outstanding_locked(req->len);
 		g_hash_table_remove(sshfs.reqtab, GUINT_TO_POINTER(id));
 	}
-	pthread_mutex_unlock(&sshfs.lock);
 	if (req != NULL) {
 		if (sshfs.debug) {
 			struct timeval now;
@@ -1642,13 +1641,12 @@ static int process_one_request(struct conn *conn)
 		req->replied = 1;
 		if (req->want_reply)
 			sem_post(&req->ready);
-		else {
-			pthread_mutex_lock(&sshfs.lock);
+		else
 			request_free(req);
-			pthread_mutex_unlock(&sshfs.lock);
-		}
 	} else
 		buf_free(&buf);
+	/* A failed sender can free req once it is no longer in the table. */
+	pthread_mutex_unlock(&sshfs.lock);
 
 	return 0;
 }
