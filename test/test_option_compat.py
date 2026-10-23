@@ -9,6 +9,7 @@ if __name__ == "__main__":
 
 import os
 import shlex
+import shutil
 import subprocess
 import sys
 from contextlib import contextmanager
@@ -98,7 +99,7 @@ def test_fstab_nofail(tmpdir, capfd):
     assert "nofail" not in captured_stderr(capfd)
 
 
-def test_ssh_accepted_algorithms_options(tmpdir, capfd):
+def test_ssh_accepted_algorithms_options(tmpdir, capfd, monkeypatch):
     """The OpenSSH 8.5 names of the key type options reach ssh."""
 
     capfd.register_output(KNOWN_HOSTS_NOISE, count=0)
@@ -107,11 +108,13 @@ def test_ssh_accepted_algorithms_options(tmpdir, capfd):
     with open(pjoin(src_dir, "remote"), "wb") as fh:
         fh.write(b"served by the mount")
 
-    # Stand-in for ssh that records what sshfs asked for. It does not hand
-    # the two options on, so the test does not depend on the OpenSSH version.
-    arg_log = str(tmpdir.join("ssh-args"))
-    wrapper = str(tmpdir.join("ssh-wrapper"))
-    with open(wrapper, "w") as fh:
+    # A stand-in "ssh" first in PATH that records what sshfs asked for. It
+    # does not hand the two options on, so the test does not depend on the
+    # OpenSSH version.
+    real_ssh = shutil.which("ssh")
+    bin_dir = str(tmpdir.mkdir("stand-in ssh"))  # the space is deliberate
+    arg_log = pjoin(bin_dir, "ssh-args")
+    with open(pjoin(bin_dir, "ssh"), "w") as fh:
         fh.write("#!/bin/sh\n")
         fh.write(f"printf '%s\\n' \"$@\" > {shlex.quote(arg_log)}\n")
         fh.write('for arg in "$@"; do\n')
@@ -122,11 +125,11 @@ def test_ssh_accepted_algorithms_options(tmpdir, capfd):
         fh.write('    *) set -- "$@" "$arg" ;;\n')
         fh.write("    esac\n")
         fh.write("done\n")
-        fh.write('exec ssh "$@"\n')
-    os.chmod(wrapper, 0o755)
+        fh.write(f'exec {shlex.quote(real_ssh)} "$@"\n')
+    os.chmod(pjoin(bin_dir, "ssh"), 0o755)
+    monkeypatch.setenv("PATH", bin_dir + os.pathsep + os.environ["PATH"])
 
     opts = [
-        f"ssh_command={wrapper}",
         "PubkeyAcceptedAlgorithms=+ssh-rsa",
         "HostbasedAcceptedAlgorithms=+ssh-rsa",
     ]
@@ -135,5 +138,11 @@ def test_ssh_accepted_algorithms_options(tmpdir, capfd):
 
     with open(arg_log) as fh:
         ssh_args = fh.read().splitlines()
-    assert "-oPubkeyAcceptedAlgorithms=+ssh-rsa" in ssh_args
-    assert "-oHostbasedAcceptedAlgorithms=+ssh-rsa" in ssh_args
+    # they have to be ssh options, not part of the destination
+    end_of_options = ssh_args.index("--")
+    for opt in (
+        "-oPubkeyAcceptedAlgorithms=+ssh-rsa",
+        "-oHostbasedAcceptedAlgorithms=+ssh-rsa",
+    ):
+        assert ssh_args.count(opt) == 1
+        assert ssh_args.index(opt) < end_of_options
