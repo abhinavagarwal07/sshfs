@@ -1444,6 +1444,34 @@ static void test_reconnect_opendir(void)
 	CHECK(!probe_dir("/d"));
 }
 
+static void test_reconnect_old_handle(void)
+{
+	struct fuse_file_info fi;
+	struct listing l;
+	uint64_t dh;
+
+	mk_dir("/d");
+	mk_file("/d/a", 1);
+
+	/* one handle, used for a listing before and again after a reconnect */
+	memset(&fi, 0, sizeof(fi));
+	REQUIRE(ops->opendir("/d", &fi) == 0);
+	dh = fi.fh;
+	memset(&l, 0, sizeof(l));
+	REQUIRE(ops->readdir("/d", &l, collect, 0, &fi, 0) == 0);
+	cache_invalidate_connection();
+
+	fi.fh = dh;
+	memset(&l, 0, sizeof(l));
+	REQUIRE(ops->readdir("/d", &l, collect, 0, &fi, 0) == 0);
+	CHECK(l.n == 1);
+	CHECK(cache_lookup("/d/a") == NULL);
+	fi.fh = dh;
+	REQUIRE(ops->releasedir("/d", &fi) == 0);
+
+	CHECK(probe_dir("/d"));
+}
+
 static void test_reconnect_readlink(void)
 {
 	char buf[64];
@@ -1766,6 +1794,8 @@ static const struct tcase cases[] = {
 	  test_reconnect_readdir, NULL },
 	{ "reconnect: a handle opened before it fills nothing",
 	  test_reconnect_opendir, NULL },
+	{ "reconnect: a handle used again after it fills nothing",
+	  test_reconnect_old_handle, NULL },
 	{ "reconnect: link in flight is not cached",
 	  test_reconnect_readlink, NULL },
 	{ "stale install: readdir in flight across mkdir (cache layer only)",
