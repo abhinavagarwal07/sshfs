@@ -224,6 +224,8 @@ static int t_session_wait_dead(void *arg)
 	return dead;
 }
 
+/* The socket is shut down first, so that held requests are failed by the
+   teardown instead of being answered */
 static int t_session_drop(struct conn *conn, struct t_responder *r)
 {
 	shutdown(r->fd, SHUT_RDWR);
@@ -234,13 +236,31 @@ static int t_session_drop(struct conn *conn, struct t_responder *r)
 	return t_wait_until(t_session_wait_dead, conn);
 }
 
-static int t_reqtab_size_is_one(void *arg)
+static int t_reqtab_size_is(void *arg)
 {
+	unsigned *want = arg;
 	int ok;
 
-	(void) arg;
 	pthread_mutex_lock(&sshfs.lock);
-	ok = g_hash_table_size(sshfs.reqtab) == 1;
+	ok = g_hash_table_size(sshfs.reqtab) == *want;
+	pthread_mutex_unlock(&sshfs.lock);
+	return ok;
+}
+
+/* A sender that has taken a request but not yet been admitted is counted
+   in req_count, and sleeps in the send window, never leaving the lock before */
+struct t_count {
+	struct conn *conn;
+	int want;
+};
+
+static int t_req_count_is(void *arg)
+{
+	struct t_count *c = arg;
+	int ok;
+
+	pthread_mutex_lock(&sshfs.lock);
+	ok = c->conn->req_count == c->want;
 	pthread_mutex_unlock(&sshfs.lock);
 	return ok;
 }
@@ -255,13 +275,6 @@ static unsigned t_outstanding_len(void)
 	return len;
 }
 
-static int t_outstanding_is(void *arg)
-{
-	unsigned *want = arg;
-
-	return t_outstanding_len() == *want;
-}
-
 static int t_idle(void)
 {
 	int idle;
@@ -273,46 +286,36 @@ static int t_idle(void)
 	return idle;
 }
 
+/* What a STAT request of this path length counts for: the string length, the
+   path, and the packet header */
+static unsigned t_wire_len(size_t pathlen)
+{
+	return pathlen + 4 + 9;
+}
+
 /* A request that expects an answer, run from its own thread */
-struct t_stat_job {
+struct t_job {
 	struct conn *conn;
-	int res;
-};
-
-static void *t_stat_thread(void *data)
-{
-	struct t_stat_job *job = data;
-	struct buffer buf;
-
-	buf_init(&buf, 0);
-	buf_add_string(&buf, "/some/path");
-	job->res = sftp_request(job->conn, SSH_FXP_STAT, &buf, SSH_FXP_ATTRS,
-				NULL);
-	buf_free(&buf);
-	return NULL;
-}
-
-static int t_stat(struct conn *conn)
-{
-	struct t_stat_job job = { .conn = conn, .res = 0 };
-
-	t_stat_thread(&job);
-	return job.res;
-}
-
-/* A request bound to the session it was made for, with a chosen size */
-struct t_bound_job {
-	struct conn *conn;
-	int connver;
+	int connver;		/* the session it is for, or CONNVER_ANY */
 	size_t pathlen;
 	uint8_t type;
 	uint8_t expect;
 	int res;
 };
 
-static void *t_bound_thread(void *data)
+static void t_job_init(struct t_job *job, struct conn *conn, size_t pathlen)
 {
-	struct t_bound_job *job = data;
+	memset(job, 0, sizeof(*job));
+	job->conn = conn;
+	job->connver = CONNVER_ANY;
+	job->pathlen = pathlen;
+	job->type = SSH_FXP_STAT;
+	job->expect = SSH_FXP_ATTRS;
+}
+
+static void *t_job_thread(void *data)
+{
+	struct t_job *job = data;
 	struct buffer buf;
 	char *path = g_malloc0(job->pathlen + 1);
 
@@ -336,6 +339,36 @@ static int t_connver(struct conn *conn)
 	return connver;
 }
 
+/* A request on the current session, answered before this returns */
+static int t_stat(struct conn *conn)
+{
+	struct t_job job;
+
+	t_job_init(&job, conn, 10);
+	t_job_thread(&job);
+	return job.res;
+}
+
+/* Wait until a writer has filled the socket, so that it is blocked in write */
+static int t_wait_socket_full(int fd)
+{
+	struct pollfd pfd = { .fd = fd, .events = POLLOUT };
+	int i;
+
+	for (i = 0; i < T_TIMEOUT_SECS * 1000; i++) {
+		int res = poll(&pfd, 1, 0);
+
+		if (res == 0)
+			return 0;
+		if (res == -1 && errno != EINTR)
+			return -1;
+		if (res > 0 && (pfd.revents & (POLLERR | POLLHUP | POLLNVAL)))
+			return -1;
+		usleep(1000);
+	}
+	return -1;
+}
+
 /*
  * The accounting of outstanding bytes is shared by all connections. When one
  * connection goes away only its own requests may be given back.
@@ -344,33 +377,49 @@ static int t_test_teardown_keeps_other_connections(void)
 {
 	struct t_responder ra;
 	struct t_responder rb;
-	struct t_stat_job job = { .conn = &sshfs.conns[0], .res = 0 };
-	pthread_t thread;
+	struct t_job ja;
+	struct t_job jb;
+	pthread_t ta;
+	pthread_t tb;
+	unsigned n;
 
 	t_responder_init(&ra);
 	t_responder_init(&rb);
+	t_job_init(&ja, &sshfs.conns[0], 20);
+	t_job_init(&jb, &sshfs.conns[1], 40);
 	if (t_session_start(&sshfs.conns[0], &ra) == -1 ||
 	    t_session_start(&sshfs.conns[1], &rb) == -1)
 		return t_fail("could not start the sessions");
 
+	/* One request pending on each connection */
 	t_responder_hold(&ra, 1);
-	if (pthread_create(&thread, NULL, t_stat_thread, &job) != 0)
+	t_responder_hold(&rb, 1);
+	if (pthread_create(&ta, NULL, t_job_thread, &ja) != 0)
 		return t_fail("pthread_create failed");
-	if (t_wait_until(t_reqtab_size_is_one, NULL) == -1)
-		return t_fail("request was not sent");
-	if (t_outstanding_len() == 0)
-		return t_fail("request was not counted");
+	n = 1;
+	if (t_wait_until(t_reqtab_size_is, &n) == -1)
+		return t_fail("first request was not sent");
+	if (pthread_create(&tb, NULL, t_job_thread, &jb) != 0)
+		return t_fail("pthread_create failed");
+	n = 2;
+	if (t_wait_until(t_reqtab_size_is, &n) == -1)
+		return t_fail("second request was not sent");
+	if (t_outstanding_len() != t_wire_len(20) + t_wire_len(40))
+		return t_fail("requests were not counted");
 
-	/* The other connection drops while the request is still pending */
+	/* Connection 1 drops: its request fails, the other one stays counted */
 	if (t_session_drop(&sshfs.conns[1], &rb) == -1)
 		return t_fail("connection 1 was not torn down");
-	if (t_outstanding_len() == 0)
-		return t_fail("tearing down one connection lost the "
-			      "accounting of another one");
+	pthread_join(tb, NULL);
+	if (jb.res != -EIO)
+		return t_fail("request of the lost connection did not fail");
+	if (t_outstanding_len() != t_wire_len(20))
+		return t_fail("tearing down one connection did not give back "
+			      "exactly its own requests");
 
 	t_responder_hold(&ra, 0);
-	pthread_join(thread, NULL);
-	if (job.res != -ENOENT)
+	pthread_join(ta, NULL);
+	if (ja.res != -ENOENT)
 		return t_fail("request did not get its answer");
 	if (t_outstanding_len() != 0)
 		return t_fail("outstanding bytes left over after the answer");
@@ -387,20 +436,22 @@ static int t_test_failed_send_is_refunded(void)
 {
 	struct t_responder ra;
 	struct conn *conn = &sshfs.conns[0];
-	struct t_stat_job job = { .conn = conn, .res = 0 };
+	struct t_job job;
 	pthread_t thread;
+	unsigned n = 1;
 
 	t_responder_init(&ra);
+	t_job_init(&job, conn, 10);
 	if (t_session_start(conn, &ra) == -1)
 		return t_fail("could not start the session");
 
 	/* Hold up the writer after the request has been counted and queued */
 	pthread_mutex_lock(&conn->lock_write);
-	if (pthread_create(&thread, NULL, t_stat_thread, &job) != 0) {
+	if (pthread_create(&thread, NULL, t_job_thread, &job) != 0) {
 		pthread_mutex_unlock(&conn->lock_write);
 		return t_fail("pthread_create failed");
 	}
-	if (t_wait_until(t_reqtab_size_is_one, NULL) == -1) {
+	if (t_wait_until(t_reqtab_size_is, &n) == -1) {
 		pthread_mutex_unlock(&conn->lock_write);
 		return t_fail("request was not queued");
 	}
@@ -423,6 +474,63 @@ static int t_test_failed_send_is_refunded(void)
 }
 
 /*
+ * With a limit on the bytes in flight, requests wait for room before they are
+ * counted. When the connection is lost they must not stay behind waiting for
+ * room that is no longer going to be freed by anything.
+ */
+static int t_test_waiting_senders_are_not_stranded(void)
+{
+	struct conn *conn = &sshfs.conns[0];
+	struct t_responder ra;
+	struct t_job jobs[3];
+	pthread_t threads[3];
+	struct t_count count = { .conn = conn };
+	unsigned n = 1;
+	int i;
+
+	/* The three requests are 80, 60 and 60 bytes: the second does not fit
+	   next to the first, the third not next to either */
+	size_t pathlen[3] = { 67, 47, 47 };
+
+	t_responder_init(&ra);
+	sshfs.max_outstanding_len = 100;
+	if (t_session_start(conn, &ra) == -1)
+		return t_fail("could not start the session");
+
+	t_responder_hold(&ra, 1);
+	for (i = 0; i < 3; i++) {
+		t_job_init(&jobs[i], conn, pathlen[i]);
+		if (pthread_create(&threads[i], NULL, t_job_thread,
+				   &jobs[i]) != 0)
+			return t_fail("pthread_create failed");
+
+		/* The first one is sent; the others are about to wait */
+		if (i == 0) {
+			if (t_wait_until(t_reqtab_size_is, &n) == -1)
+				return t_fail("first request was not sent");
+		} else {
+			count.want = i + 1;
+			if (t_wait_until(t_req_count_is, &count) == -1)
+				return t_fail("request was not taken");
+		}
+	}
+
+	if (t_session_drop(conn, &ra) == -1)
+		return t_fail("session was not torn down");
+	for (i = 0; i < 3; i++) {
+		pthread_join(threads[i], NULL);
+		if (jobs[i].res != -EIO)
+			return t_fail("request for a lost connection did not "
+				      "fail");
+	}
+
+	sshfs.max_outstanding_len = ~0U;
+	if (!t_idle())
+		return t_fail("requests left behind or still counted");
+	return 0;
+}
+
+/*
  * The connection drops, and another one is set up, after a request has been
  * checked against the old one but before it is written. Its handle means
  * nothing to the new session, so it must not be sent there.
@@ -432,23 +540,26 @@ static int t_test_stale_request_not_sent_to_new_session(void)
 	struct conn *conn = &sshfs.conns[0];
 	struct t_responder ra;
 	struct t_responder rb;
-	struct t_bound_job job = { .conn = conn, .pathlen = 2,
-				   .type = SSH_FXP_CLOSE, .expect = 0 };
+	struct t_job job;
 	pthread_t thread;
+	unsigned n = 1;
 
 	t_responder_init(&ra);
 	t_responder_init(&rb);
+	t_job_init(&job, conn, 2);
+	job.type = SSH_FXP_CLOSE;
+	job.expect = 0;
 	if (t_session_start(conn, &ra) == -1)
 		return t_fail("could not start the first session");
 	job.connver = t_connver(conn);
 
 	/* Hold up the writer after the request has been checked and queued */
 	pthread_mutex_lock(&conn->lock_write);
-	if (pthread_create(&thread, NULL, t_bound_thread, &job) != 0) {
+	if (pthread_create(&thread, NULL, t_job_thread, &job) != 0) {
 		pthread_mutex_unlock(&conn->lock_write);
 		return t_fail("pthread_create failed");
 	}
-	if (t_wait_until(t_reqtab_size_is_one, NULL) == -1) {
+	if (t_wait_until(t_reqtab_size_is, &n) == -1) {
 		pthread_mutex_unlock(&conn->lock_write);
 		return t_fail("request was not queued");
 	}
@@ -480,81 +591,57 @@ static int t_test_stale_request_not_sent_to_new_session(void)
 }
 
 /*
- * Requests that wait for room in the send window are not known to the
- * teardown. When the connection they were made for is gone they have to give
- * up and give back what they counted, also while others are still over the
- * limit.
+ * A request that waits for room, because another connection is using it,
+ * must give up when its own connection is lost, rather than go back to sleep
+ * until the other connection frees the room.
  */
-static int t_test_waiting_sender_gives_up_after_reconnect(void)
+static int t_test_waiting_sender_gives_up_with_its_connection(void)
 {
-	struct conn *conn = &sshfs.conns[0];
 	struct t_responder ra;
-	struct t_bound_job jobs[3];
-	pthread_t threads[3];
-	unsigned counted;
-	int connver;
-	int i;
-
-	/* The three requests are 80, 60 and 60 bytes long on the wire */
-	size_t pathlen[3] = { 67, 47, 47 };
+	struct t_responder rb;
+	struct t_job other;
+	struct t_job waiter;
+	struct t_count count = { .conn = &sshfs.conns[0], .want = 1 };
+	pthread_t tother;
+	pthread_t twaiter;
+	unsigned n = 1;
 
 	t_responder_init(&ra);
+	t_responder_init(&rb);
+	t_job_init(&other, &sshfs.conns[1], 67);	/* 80 bytes */
+	t_job_init(&waiter, &sshfs.conns[0], 47);	/* 60 bytes */
 	sshfs.max_outstanding_len = 100;
-	if (t_session_start(conn, &ra) == -1)
-		return t_fail("could not start the session");
-	connver = t_connver(conn);
+	if (t_session_start(&sshfs.conns[0], &ra) == -1 ||
+	    t_session_start(&sshfs.conns[1], &rb) == -1)
+		return t_fail("could not start the sessions");
+	waiter.connver = t_connver(&sshfs.conns[0]);
 
-	t_responder_hold(&ra, 1);
-	for (i = 0; i < 3; i++) {
-		jobs[i].conn = conn;
-		jobs[i].connver = connver;
-		jobs[i].pathlen = pathlen[i];
-		jobs[i].type = SSH_FXP_STAT;
-		jobs[i].expect = SSH_FXP_ATTRS;
-		jobs[i].res = 0;
-		if (pthread_create(&threads[i], NULL, t_bound_thread,
-				   &jobs[i]) != 0)
-			return t_fail("pthread_create failed");
+	t_responder_hold(&rb, 1);
+	if (pthread_create(&tother, NULL, t_job_thread, &other) != 0)
+		return t_fail("pthread_create failed");
+	if (t_wait_until(t_reqtab_size_is, &n) == -1)
+		return t_fail("first request was not sent");
+	if (pthread_create(&twaiter, NULL, t_job_thread, &waiter) != 0)
+		return t_fail("pthread_create failed");
+	if (t_wait_until(t_req_count_is, &count) == -1)
+		return t_fail("second request was not taken");
 
-		/* One after the other, so that the first one gets the room */
-		counted = i == 0 ? 80 : (i == 1 ? 140 : 200);
-		if (t_wait_until(t_outstanding_is, &counted) == -1)
-			return t_fail("request was not counted");
-	}
+	/* Its connection goes away while the other one still holds the room */
+	if (t_session_drop(&sshfs.conns[0], &ra) == -1)
+		return t_fail("connection 0 was not torn down");
+	pthread_join(twaiter, NULL);
+	if (waiter.res != -EIO)
+		return t_fail("waiting request did not fail with its "
+			      "connection");
 
-	if (t_session_drop(conn, &ra) == -1)
-		return t_fail("session was not torn down");
-	for (i = 0; i < 3; i++) {
-		pthread_join(threads[i], NULL);
-		if (jobs[i].res != -EIO)
-			return t_fail("request for a lost connection did not "
-				      "fail");
-	}
-
+	t_responder_hold(&rb, 0);
+	pthread_join(tother, NULL);
+	if (t_session_drop(&sshfs.conns[1], &rb) == -1)
+		return t_fail("connection 1 was not torn down");
 	sshfs.max_outstanding_len = ~0U;
 	if (!t_idle())
 		return t_fail("requests left behind or still counted");
 	return 0;
-}
-
-/* Wait until a writer has filled the socket, so that it is blocked in write */
-static int t_wait_socket_full(int fd)
-{
-	struct pollfd pfd = { .fd = fd, .events = POLLOUT };
-	int i;
-
-	for (i = 0; i < T_TIMEOUT_SECS * 1000; i++) {
-		int res = poll(&pfd, 1, 0);
-
-		if (res == 0)
-			return 0;
-		if (res == -1 && errno != EINTR)
-			return -1;
-		if (res > 0 && (pfd.revents & (POLLERR | POLLHUP | POLLNVAL)))
-			return -1;
-		usleep(1000);
-	}
-	return -1;
 }
 
 /*
@@ -567,15 +654,14 @@ static int t_test_blocked_writer_is_released(void)
 {
 	struct conn *conn = &sshfs.conns[0];
 	struct t_responder ra;
-	struct t_bound_job job = { .conn = conn, .pathlen = 8 << 20,
-				   .type = SSH_FXP_STAT,
-				   .expect = SSH_FXP_ATTRS };
+	struct t_job job;
 	static const uint8_t rubbish[8] = { 0xff, 0xff, 0xff, 0xff,
 					    0xff, 0xff, 0xff, 0xff };
 	int sndbuf = 4096;
 	pthread_t thread;
 
 	t_responder_init(&ra);
+	t_job_init(&job, conn, 8 << 20);
 	if (t_session_start(conn, &ra) == -1)
 		return t_fail("could not start the session");
 	job.connver = t_connver(conn);
@@ -584,7 +670,7 @@ static int t_test_blocked_writer_is_released(void)
 	if (setsockopt(conn->wfd, SOL_SOCKET, SO_SNDBUF, &sndbuf,
 		       sizeof(sndbuf)) == -1)
 		return t_fail("setsockopt failed");
-	if (pthread_create(&thread, NULL, t_bound_thread, &job) != 0)
+	if (pthread_create(&thread, NULL, t_job_thread, &job) != 0)
 		return t_fail("pthread_create failed");
 	if (t_wait_socket_full(conn->wfd) == -1)
 		return t_fail("writer did not fill the socket");
@@ -612,12 +698,11 @@ static int t_test_dup_failure_is_refunded(void)
 	struct t_responder ra;
 	struct rlimit lim;
 	struct rlimit saved;
-	struct t_bound_job job = { .conn = conn, .pathlen = 2,
-				   .type = SSH_FXP_STAT,
-				   .expect = SSH_FXP_ATTRS };
+	struct t_job job;
 	int spare;
 
 	t_responder_init(&ra);
+	t_job_init(&job, conn, 2);
 	if (t_session_start(conn, &ra) == -1)
 		return t_fail("could not start the session");
 	job.connver = t_connver(conn);
@@ -632,7 +717,7 @@ static int t_test_dup_failure_is_refunded(void)
 	if (setrlimit(RLIMIT_NOFILE, &lim) == -1)
 		return t_fail("setrlimit failed");
 
-	t_bound_thread(&job);
+	t_job_thread(&job);
 
 	if (setrlimit(RLIMIT_NOFILE, &saved) == -1)
 		return t_fail("could not restore the descriptor limit");
@@ -672,13 +757,15 @@ int main(void)
 		return 1;
 	if (t_test_failed_send_is_refunded() != 0)
 		return 1;
+	if (t_test_waiting_senders_are_not_stranded() != 0)
+		return 1;
 	if (t_test_stale_request_not_sent_to_new_session() != 0)
 		return 1;
-	if (t_test_waiting_sender_gives_up_after_reconnect() != 0)
-		return 1;
-	if (t_test_dup_failure_is_refunded() != 0)
+	if (t_test_waiting_sender_gives_up_with_its_connection() != 0)
 		return 1;
 	if (t_test_blocked_writer_is_released() != 0)
+		return 1;
+	if (t_test_dup_failure_is_refunded() != 0)
 		return 1;
 
 	return 0;

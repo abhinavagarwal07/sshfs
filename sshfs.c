@@ -1557,6 +1557,17 @@ static void chunk_put_locked(struct read_chunk *chunk)
 	pthread_mutex_unlock(&sshfs.lock);
 }
 
+/* Called with sshfs.lock held, once for every request that was counted */
+static void subtract_outstanding_locked(size_t len)
+{
+	if (len > sshfs.outstanding_len)
+		sshfs.outstanding_len = 0;
+	else
+		sshfs.outstanding_len -= len;
+
+	pthread_cond_broadcast(&sshfs.outstanding_cond);
+}
+
 static int clean_req(void *key, struct request *req, gpointer user_data)
 {
 	(void) key;
@@ -1565,45 +1576,13 @@ static int clean_req(void *key, struct request *req, gpointer user_data)
 	if (req->conn != conn)
 		return FALSE;
 
+	subtract_outstanding_locked(req->len);
 	req->error = -EIO;
 	if (req->want_reply)
 		sem_post(&req->ready);
 	else
 		request_free(req);
 
-	return TRUE;
-}
-
-/* Called with sshfs.lock held, once for every request that was counted */
-static void subtract_outstanding_locked(size_t len)
-{
-	int was_over = sshfs.outstanding_len > sshfs.max_outstanding_len;
-
-	if (len > sshfs.outstanding_len)
-		sshfs.outstanding_len = 0;
-	else
-		sshfs.outstanding_len -= len;
-
-	if (was_over && sshfs.outstanding_len <= sshfs.max_outstanding_len)
-		pthread_cond_broadcast(&sshfs.outstanding_cond);
-}
-
-struct clean_req_ctx {
-	struct conn *conn;
-	size_t removed_len;
-};
-
-static int clean_req_counting(void *key, struct request *req,
-			      gpointer user_data)
-{
-	struct clean_req_ctx *ctx = (struct clean_req_ctx *) user_data;
-	size_t len = req->len;
-
-	if (!clean_req(key, req, ctx->conn))
-		return FALSE;
-
-	/* req may be gone now */
-	ctx->removed_len += len;
 	return TRUE;
 }
 
@@ -1703,7 +1682,6 @@ static void *process_requests(void *data_)
 {
 	(void) data_;
 	struct conn *conn = data_;
-	struct clean_req_ctx ctx = { .conn = conn, .removed_len = 0 };
 
 	while (1) {
 		if (process_one_request(conn) == -1)
@@ -1713,14 +1691,12 @@ static void *process_requests(void *data_)
 	pthread_mutex_lock(&sshfs.lock);
 	conn->processing_thread_started = 0;
 	close_conn(conn);
-	g_hash_table_foreach_remove(sshfs.reqtab, (GHRFunc) clean_req_counting,
-				    &ctx);
+	/* gives back the bytes of this connection's requests, not others' */
+	g_hash_table_foreach_remove(sshfs.reqtab, (GHRFunc) clean_req, conn);
 	/* Nothing cached from the old session may be served after a reconnect */
 	if (sshfs.reconnect && sshfs.dir_cache)
 		cache_invalidate_connection();
 	conn->connver = ++sshfs.connvers;
-	/* Only this connection's requests are gone; others are still counted */
-	subtract_outstanding_locked(ctx.removed_len);
 	pthread_cond_broadcast(&sshfs.outstanding_cond);
 	pthread_mutex_unlock(&sshfs.lock);
 
@@ -2175,13 +2151,18 @@ static int sftp_request_send_connver(struct conn *conn, int expected_connver,
 		goto out;
 	}
 	req->len = iov_length(iov, count) + 9;
-	sshfs.outstanding_len += req->len;
-	while (sshfs.outstanding_len > sshfs.max_outstanding_len) {
+	/*
+	 * Only requests in the table are counted, so one that waits for room
+	 * has nothing to give back if its connection goes away meanwhile.
+	 */
+	while (sshfs.outstanding_len &&
+	       (uint64_t) sshfs.outstanding_len + req->len >
+	       sshfs.max_outstanding_len) {
 		/* The lock is dropped while waiting; the connection may be gone */
 		pthread_cond_wait(&sshfs.outstanding_cond, &sshfs.lock);
 		if (expected_connver != CONNVER_ANY &&
 		    conn->connver != expected_connver)
-			goto out_counted;
+			goto out_unlock;
 	}
 
 	/*
@@ -2191,12 +2172,13 @@ static int sftp_request_send_connver(struct conn *conn, int expected_connver,
 	 * a newer session that reuses the descriptor number.
 	 */
 	if (conn->wfd == -1)
-		goto out_counted;
+		goto out_unlock;
 	wfd = dup_cloexec(conn->wfd);
 	if (wfd == -1) {
 		perror("dup");
-		goto out_counted;
+		goto out_unlock;
 	}
+	sshfs.outstanding_len += req->len;
 
 	g_hash_table_insert(sshfs.reqtab, GUINT_TO_POINTER(id), req);
 	if (sshfs.debug) {
@@ -2229,8 +2211,7 @@ static int sftp_request_send_connver(struct conn *conn, int expected_connver,
 		*reqp = req;
 	return 0;
 
-out_counted:
-	subtract_outstanding_locked(req->len);
+out_unlock:
 	pthread_mutex_unlock(&sshfs.lock);
 	err = -EIO;
 out:
