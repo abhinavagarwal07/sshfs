@@ -72,7 +72,7 @@ def cleanup(mount_process, mnt_dir):
             stderr=subprocess.STDOUT,
             timeout=10,
         )
-    except subprocess.TimeoutExpired:
+    except (subprocess.TimeoutExpired, OSError):
         pass
     finally:
         # give it time to exit by itself, SIGTERM cuts its shutdown short
@@ -129,6 +129,7 @@ def require_fuse():
     return os.environ.get("SSHFS_TEST_REQUIRE_FUSE", "no").lower().strip() not in (
         "",
         "no",
+        "off",
         "false",
         "0",
     )
