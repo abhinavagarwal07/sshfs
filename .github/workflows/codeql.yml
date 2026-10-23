@@ -6,7 +6,7 @@ on:
   pull_request:
     branches: [master]
   schedule:
-    - cron: '27 4 * * 1'
+    - cron: '27 4 1 * *'
   workflow_dispatch:
 
 permissions:
@@ -44,7 +44,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y gcc ninja-build pkg-config libglib2.0-dev libfuse3-dev
-          pip3 install meson
+          pip3 install meson==1.12.1
 
       - name: Build
         run: |
