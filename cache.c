@@ -33,6 +33,7 @@ struct cache {
 	pthread_mutex_t lock;
 	time_t last_cleaned;
 	uint64_t write_ctr;
+	uint64_t conn_epoch;
 };
 
 static struct cache cache;
@@ -53,6 +54,7 @@ struct readdir_handle {
 	fuse_fill_dir_t filler;
 	GPtrArray *dir;
 	uint64_t wrctr;
+	uint64_t epoch;
 };
 
 struct file_handle {
@@ -61,6 +63,10 @@ struct file_handle {
 
 	/* If so, this will hold its handle */
 	unsigned long fs_fh;
+
+	/* The counters from just before it was opened */
+	uint64_t epoch;
+	uint64_t wrctr;
 };
 
 struct cache_dirent {
@@ -138,6 +144,21 @@ void cache_invalidate(const char *path)
 	pthread_mutex_unlock(&cache.lock);
 }
 
+/*
+ * Drop everything cached from the previous connection.  Lookups that were
+ * already in flight must not add their (old) result afterwards, so this moves
+ * the epoch that cache_add_dir()/cache_add_link() check and the write counter
+ * that cache_add_attr() checks.
+ */
+void cache_invalidate_connection(void)
+{
+	pthread_mutex_lock(&cache.lock);
+	g_hash_table_remove_all(cache.table);
+	cache.write_ctr++;
+	cache.conn_epoch++;
+	pthread_mutex_unlock(&cache.lock);
+}
+
 static void cache_invalidate_write(const char *path)
 {
 	pthread_mutex_lock(&cache.lock);
@@ -202,11 +223,16 @@ void cache_add_attr(const char *path, const struct stat *stbuf, uint64_t wrctr)
 	pthread_mutex_unlock(&cache.lock);
 }
 
-static void cache_add_dir(const char *path, GPtrArray *dir)
+static void cache_add_dir(const char *path, GPtrArray *dir, uint64_t epoch)
 {
 	struct node *node;
 
 	pthread_mutex_lock(&cache.lock);
+	if (epoch != cache.conn_epoch) {
+		pthread_mutex_unlock(&cache.lock);
+		g_ptr_array_free(dir, TRUE);
+		return;
+	}
 	node = cache_get(path);
 	if (node->dir != NULL) {
 		g_ptr_array_free(node->dir, TRUE);
@@ -226,11 +252,16 @@ static size_t my_strnlen(const char *s, size_t maxsize)
 	return p - s;
 }
 
-static void cache_add_link(const char *path, const char *link, size_t size)
+static void cache_add_link(const char *path, const char *link, size_t size,
+			   uint64_t epoch)
 {
 	struct node *node;
 
 	pthread_mutex_lock(&cache.lock);
+	if (epoch != cache.conn_epoch) {
+		pthread_mutex_unlock(&cache.lock);
+		return;
+	}
 	node = cache_get(path);
 	g_free(node->link);
 	node->link = g_strndup(link, my_strnlen(link, size-1));
@@ -256,6 +287,25 @@ static int cache_get_attr(const char *path, struct stat *stbuf)
 	}
 	pthread_mutex_unlock(&cache.lock);
 	return err;
+}
+
+static uint64_t cache_get_conn_epoch(void)
+{
+	uint64_t res;
+
+	pthread_mutex_lock(&cache.lock);
+	res = cache.conn_epoch;
+	pthread_mutex_unlock(&cache.lock);
+	return res;
+}
+
+/* The counters of a directory handle taken together, as of when it was opened */
+static void cache_get_counters(uint64_t *epoch, uint64_t *wrctr)
+{
+	pthread_mutex_lock(&cache.lock);
+	*epoch = cache.conn_epoch;
+	*wrctr = cache.write_ctr;
+	pthread_mutex_unlock(&cache.lock);
 }
 
 uint64_t cache_get_write_ctr(void)
@@ -298,6 +348,7 @@ static int cache_readlink(const char *path, char *buf, size_t size)
 {
 	struct node *node;
 	int err;
+	uint64_t epoch;
 
 	pthread_mutex_lock(&cache.lock);
 	node = cache_lookup(path);
@@ -311,9 +362,10 @@ static int cache_readlink(const char *path, char *buf, size_t size)
 		}
 	}
 	pthread_mutex_unlock(&cache.lock);
+	epoch = cache_get_conn_epoch();
 	err = cache.next_oper->readlink(path, buf, size);
 	if (!err)
-		cache_add_link(path, buf, size);
+		cache_add_link(path, buf, size, epoch);
 
 	return err;
 }
@@ -417,6 +469,7 @@ static int cache_readdir(const char *path, void *buf, fuse_fill_dir_t filler,
 	if(cfi->is_open)
 		fi->fh = cfi->fs_fh;
 	else {
+		cache_get_counters(&cfi->epoch, &cfi->wrctr);
 		if(cache.next_oper->opendir) {
 			err = cache.next_oper->opendir(path, fi);
 			if(err)
@@ -431,13 +484,20 @@ static int cache_readdir(const char *path, void *buf, fuse_fill_dir_t filler,
 	ch.filler = filler;
 	ch.dir = g_ptr_array_new();
 	g_ptr_array_set_free_func(ch.dir, free_cache_dirent);
-	ch.wrctr = cache_get_write_ctr();
+	/*
+	 * A handle that was opened before a reconnect belongs to the old
+	 * session, so nothing it returns may be cached.
+	 */
+	ch.epoch = cfi->epoch;
+	pthread_mutex_lock(&cache.lock);
+	ch.wrctr = ch.epoch == cache.conn_epoch ? cache.write_ctr : cfi->wrctr;
+	pthread_mutex_unlock(&cache.lock);
 	/* Always request a fresh, complete enumeration to (re)fill the cache */
 	err = cache.next_oper->readdir(path, &ch, cache_dirfill, 0, fi, flags);
 	g_ptr_array_add(ch.dir, NULL);
 	dir = ch.dir;
 	if (!err) {
-		cache_add_dir(path, dir);
+		cache_add_dir(path, dir, ch.epoch);
 	} else {
 		g_ptr_array_free(dir, TRUE);
 	}
