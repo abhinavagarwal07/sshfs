@@ -85,8 +85,9 @@ Options
 
 -o reconnect
    automatically reconnect to server if connection is
-   interrupted. Attempts to access files that were opened before the
-   reconnection will give errors and need to be re-opened.
+   interrupted. Attempts to access files or directories that were opened
+   before the reconnection will give errors and need to be re-opened,
+   although cached data may still be returned.
 
 -o delay_connect
    Don't immediately connect to server, wait until mountpoint is first

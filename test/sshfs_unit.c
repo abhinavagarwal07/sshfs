@@ -82,6 +82,8 @@ static int t_mutex_unlock(pthread_mutex_t *mutex)
 	return res;
 }
 
+#include <sys/resource.h>
+
 #define T_MAX_CONNS 2
 #define T_MAX_SEEN 32
 
@@ -97,6 +99,7 @@ struct t_responder {
 	int hold;		/* delay the answers until released */
 	unsigned nseen;		/* request types received, apart from INIT */
 	uint8_t seen[T_MAX_SEEN];
+	int reorder_readdir;	/* return a later NAME before an earlier EOF */
 };
 
 static int t_fail(const char *msg)
@@ -159,17 +162,28 @@ static void t_reply_version(int fd)
 	(void) t_write_full(fd, msg, sizeof(msg));
 }
 
-/* STATUS: no such file, empty message and language tag */
-static void t_reply_status(int fd, uint32_t id)
+/* STATUS with an empty message and language tag */
+static void t_reply_status(int fd, uint32_t id, uint32_t status)
 {
 	uint8_t msg[21];
 
 	t_put_be32(msg, 17);
 	msg[4] = SSH_FXP_STATUS;
 	t_put_be32(msg + 5, id);
-	t_put_be32(msg + 9, SSH_FX_NO_SUCH_FILE);
+	t_put_be32(msg + 9, status);
 	t_put_be32(msg + 13, 0);
 	t_put_be32(msg + 17, 0);
+	(void) t_write_full(fd, msg, sizeof(msg));
+}
+
+static void t_reply_empty_name(int fd, uint32_t id)
+{
+	uint8_t msg[13];
+
+	t_put_be32(msg, 9);
+	msg[4] = SSH_FXP_NAME;
+	t_put_be32(msg + 5, id);
+	t_put_be32(msg + 9, 0);
 	(void) t_write_full(fd, msg, sizeof(msg));
 }
 
@@ -178,6 +192,8 @@ static void *t_responder_main(void *data)
 	struct t_responder *r = data;
 	uint8_t hdr[4];
 	uint8_t body[4096];
+	unsigned readdir_count = 0;
+	uint32_t eof_id = 0;
 
 	for (;;) {
 		uint32_t len;
@@ -204,7 +220,17 @@ static void *t_responder_main(void *data)
 			pthread_cond_wait(&r->cond, &r->lock);
 		pthread_mutex_unlock(&r->lock);
 
-		t_reply_status(r->fd, id);
+		if (r->reorder_readdir && body[0] == SSH_FXP_READDIR) {
+			readdir_count++;
+			if (readdir_count == 1)
+				eof_id = id;
+			else {
+				t_reply_empty_name(r->fd, id);
+				if (readdir_count == 2)
+					t_reply_status(r->fd, eof_id, SSH_FX_EOF);
+			}
+		} else
+			t_reply_status(r->fd, id, SSH_FX_NO_SUCH_FILE);
 	}
 	return NULL;
 }
@@ -357,6 +383,7 @@ static unsigned t_wire_len(size_t pathlen)
 /* A request that expects an answer, run from its own thread */
 struct t_job {
 	struct conn *conn;
+	int connver;		/* the session it is for, or CONNVER_ANY */
 	size_t pathlen;
 	uint8_t type;
 	uint8_t expect;
@@ -367,6 +394,7 @@ static void t_job_init(struct t_job *job, struct conn *conn, size_t pathlen)
 {
 	memset(job, 0, sizeof(*job));
 	job->conn = conn;
+	job->connver = CONNVER_ANY;
 	job->pathlen = pathlen;
 	job->type = SSH_FXP_STAT;
 	job->expect = SSH_FXP_ATTRS;
@@ -381,10 +409,51 @@ static void *t_job_thread(void *data)
 	memset(path, 'x', job->pathlen);
 	buf_init(&buf, 0);
 	buf_add_string(&buf, path);
-	job->res = sftp_request(job->conn, job->type, &buf, job->expect, NULL);
+	job->res = sftp_request_connver(job->conn, job->connver, job->type,
+					&buf, job->expect, NULL);
 	buf_free(&buf);
 	g_free(path);
 	return NULL;
+}
+
+static int t_connver(struct conn *conn)
+{
+	int connver;
+
+	pthread_mutex_lock(&sshfs.lock);
+	connver = conn->connver;
+	pthread_mutex_unlock(&sshfs.lock);
+	return connver;
+}
+
+/* A request on the current session, answered before this returns */
+static int t_stat(struct conn *conn)
+{
+	struct t_job job;
+
+	t_job_init(&job, conn, 10);
+	t_job_thread(&job);
+	return job.res;
+}
+
+/* Wait until a writer has filled the socket, so that it is blocked in write */
+static int t_wait_socket_full(int fd)
+{
+	struct pollfd pfd = { .fd = fd, .events = POLLOUT };
+	int i;
+
+	for (i = 0; i < T_TIMEOUT_SECS * 1000; i++) {
+		int res = poll(&pfd, 1, 0);
+
+		if (res == 0)
+			return 0;
+		if (res == -1 && errno != EINTR)
+			return -1;
+		if (res > 0 && (pfd.revents & (POLLERR | POLLHUP | POLLNVAL)))
+			return -1;
+		usleep(1000);
+	}
+	return -1;
 }
 
 /*
@@ -624,6 +693,257 @@ static int t_test_waiting_sender_gives_up_with_its_connection(void)
 	return 0;
 }
 
+/* A read request that failed is an error for the reader, not end of file */
+static int t_test_failed_read_is_an_error(void)
+{
+	struct read_chunk *chunk = g_new0(struct read_chunk, 1);
+	struct read_req *rreq = g_new0(struct read_req, 1);
+	char buf[16];
+
+	list_init(&chunk->reqs);
+	pthread_cond_init(&chunk->sio.finished, NULL);
+	chunk->refs = 1;
+	chunk->size = sizeof(buf);
+	rreq->sio = &chunk->sio;
+	rreq->size = sizeof(buf);
+	rreq->res = -EIO;
+	buf_init(&rreq->data, 0);
+	list_add(&rreq->list, &chunk->reqs);
+
+	/* wait_chunk() frees the chunk and the request */
+	if (wait_chunk(chunk, buf, sizeof(buf)) != -EIO)
+		return t_fail("a failed read was not reported as an error");
+	return 0;
+}
+
+/*
+ * The connection drops, and another one is set up, after a request has been
+ * checked against the old one but before it is written. Its handle means
+ * nothing to the new session, so it must not be sent there.
+ */
+static int t_test_stale_request_not_sent_to_new_session(void)
+{
+	struct conn *conn = &sshfs.conns[0];
+	struct t_responder ra;
+	struct t_responder rb;
+	struct t_job job;
+	pthread_t thread;
+	unsigned n = 1;
+
+	t_responder_init(&ra);
+	t_responder_init(&rb);
+	t_job_init(&job, conn, 2);
+	job.type = SSH_FXP_CLOSE;
+	job.expect = 0;
+	if (t_session_start(conn, &ra) == -1)
+		return t_fail("could not start the first session");
+	job.connver = t_connver(conn);
+
+	/* Hold up the writer after the request has been checked and queued */
+	pthread_mutex_lock(&conn->lock_write);
+	if (pthread_create(&thread, NULL, t_job_thread, &job) != 0) {
+		pthread_mutex_unlock(&conn->lock_write);
+		return t_fail("pthread_create failed");
+	}
+	if (t_wait_until(t_reqtab_size_is, &n) == -1) {
+		pthread_mutex_unlock(&conn->lock_write);
+		return t_fail("request was not queued");
+	}
+
+	/* Drop the connection and bring up a new one; fds get reused */
+	if (t_session_drop(conn, &ra) == -1) {
+		pthread_mutex_unlock(&conn->lock_write);
+		return t_fail("first session was not torn down");
+	}
+	if (t_session_start(conn, &rb) == -1) {
+		pthread_mutex_unlock(&conn->lock_write);
+		return t_fail("could not start the second session");
+	}
+	pthread_mutex_unlock(&conn->lock_write);
+	pthread_join(thread, NULL);
+	if (job.res != -EIO)
+		return t_fail("the request for the old session was not refused");
+
+	/* The answer to this arrives after everything written before it */
+	if (t_stat(conn) != -ENOENT)
+		return t_fail("new session does not answer");
+	if (t_responder_seen(&rb, SSH_FXP_CLOSE) != 0)
+		return t_fail("a request for the old session reached the "
+			      "new one");
+
+	if (t_session_drop(conn, &rb) == -1)
+		return t_fail("second session was not torn down");
+	if (!t_idle())
+		return t_fail("requests left behind");
+	return 0;
+}
+
+/*
+ * A writer that is blocked on a full socket must not stay blocked once the
+ * connection is retired, or the next reconnect would wait for it forever.
+ * The far end stays open but does not read, and then sends rubbish so that
+ * sshfs gives up on the connection.
+ */
+static int t_test_blocked_writer_is_released(void)
+{
+	struct conn *conn = &sshfs.conns[0];
+	struct t_responder ra;
+	struct t_job job;
+	static const uint8_t rubbish[8] = { 0xff, 0xff, 0xff, 0xff,
+					    0xff, 0xff, 0xff, 0xff };
+	int sndbuf = 4096;
+	pthread_t thread;
+
+	t_responder_init(&ra);
+	t_job_init(&job, conn, 8 << 20);
+	if (t_session_start(conn, &ra) == -1)
+		return t_fail("could not start the session");
+	job.connver = t_connver(conn);
+
+	/* A small send buffer, and a request that cannot fit in it */
+	if (setsockopt(conn->wfd, SOL_SOCKET, SO_SNDBUF, &sndbuf,
+		       sizeof(sndbuf)) == -1)
+		return t_fail("setsockopt failed");
+	if (pthread_create(&thread, NULL, t_job_thread, &job) != 0)
+		return t_fail("pthread_create failed");
+	if (t_wait_socket_full(conn->wfd) == -1)
+		return t_fail("writer did not fill the socket");
+
+	if (t_write_full(ra.fd, rubbish, sizeof(rubbish)) == -1)
+		return t_fail("could not write to the connection");
+	if (t_wait_until(t_session_wait_dead, conn) == -1)
+		return t_fail("connection was not retired");
+
+	pthread_join(thread, NULL);
+	if (job.res != -EIO)
+		return t_fail("blocked request did not fail");
+
+	if (t_session_drop(conn, &ra) == -1)
+		return t_fail("session was not torn down");
+	if (!t_idle())
+		return t_fail("requests left behind");
+	return 0;
+}
+
+/* Running out of descriptors for the private reference must not leak counts */
+static int t_test_dup_failure_is_refunded(void)
+{
+	struct conn *conn = &sshfs.conns[0];
+	struct t_responder ra;
+	struct rlimit lim;
+	struct rlimit saved;
+	struct t_job job;
+	int spare;
+
+	t_responder_init(&ra);
+	t_job_init(&job, conn, 2);
+	if (t_session_start(conn, &ra) == -1)
+		return t_fail("could not start the session");
+	job.connver = t_connver(conn);
+
+	/* Allow no descriptor above the lowest free one (as dup_cloexec picks) */
+	spare = fcntl(STDERR_FILENO, F_DUPFD, 3);
+	if (spare == -1 || getrlimit(RLIMIT_NOFILE, &saved) == -1)
+		return t_fail("could not prepare the descriptor limit");
+	close(spare);
+	lim = saved;
+	lim.rlim_cur = spare;
+	if (setrlimit(RLIMIT_NOFILE, &lim) == -1)
+		return t_fail("setrlimit failed");
+
+	t_job_thread(&job);
+
+	if (setrlimit(RLIMIT_NOFILE, &saved) == -1)
+		return t_fail("could not restore the descriptor limit");
+	if (job.res != -EIO)
+		return t_fail("request did not fail without a descriptor");
+	if (!t_idle())
+		return t_fail("failed request left its count behind");
+	if (t_responder_seen(&ra, SSH_FXP_STAT) != 0)
+		return t_fail("the failed request reached the server");
+
+	if (t_session_drop(conn, &ra) == -1)
+		return t_fail("session was not torn down");
+	return 0;
+}
+
+/* The fstat workaround may use a path, but still belongs to the open file's
+   session. A replacement file after reconnect must not supply its metadata. */
+static int t_test_fstat_workaround_keeps_session(void)
+{
+	struct conn *conn = &sshfs.conns[0];
+	struct t_responder ra;
+	struct t_responder rb;
+	struct sshfs_file sf = { .conn = conn };
+	struct fuse_file_info fi = { .fh = (unsigned long) &sf };
+	struct stat stbuf;
+	int follow;
+
+	t_responder_init(&ra);
+	t_responder_init(&rb);
+	if (t_session_start(conn, &ra) == -1)
+		return t_fail("could not start the session");
+	sf.connver = t_connver(conn);
+	sshfs.fstat_workaround = 1;
+	for (follow = 0; follow <= 1; follow++) {
+		sshfs.follow_symlinks = follow;
+		if (sshfs_getattr("/file", &stbuf, &fi) != -ENOENT)
+			return t_fail("current file's path lookup did not get its reply");
+	}
+	if (t_responder_seen(&ra, SSH_FXP_STAT) != 1 ||
+	    t_responder_seen(&ra, SSH_FXP_LSTAT) != 1 ||
+	    t_responder_seen(&ra, SSH_FXP_FSTAT) != 0)
+		return t_fail("fstat workaround did not use path lookups");
+	if (t_session_drop(conn, &ra) == -1 ||
+	    t_session_start(conn, &rb) == -1)
+		return t_fail("could not replace the session");
+	for (follow = 0; follow <= 1; follow++) {
+		sshfs.follow_symlinks = follow;
+		if (sshfs_getattr("/file", &stbuf, &fi) != -EIO)
+			return t_fail("stale file used the fstat workaround");
+	}
+	if (t_responder_seen(&rb, SSH_FXP_STAT) != 0 ||
+	    t_responder_seen(&rb, SSH_FXP_LSTAT) != 0)
+		return t_fail("stale file's path lookup reached the new session");
+	/* A reopened file can use the workaround on the replacement session. */
+	sf.connver = t_connver(conn);
+	if (sshfs_getattr("/file", &stbuf, &fi) != -ENOENT ||
+	    t_responder_seen(&rb, SSH_FXP_STAT) != 1)
+		return t_fail("reopened file could not use the fstat workaround");
+	sshfs.follow_symlinks = 0;
+	sshfs.fstat_workaround = 0;
+	if (t_session_drop(conn, &rb) == -1 || !t_idle())
+		return t_fail("requests left behind");
+	return 0;
+}
+
+/* The second reply is already complete when the first reports EOF. It must
+   be drained and freed even though its directory entries are not consumed. */
+static int t_test_readdir_drains_completed_reply(void)
+{
+	struct conn *conn = &sshfs.conns[0];
+	struct t_responder ra;
+	struct buffer handle;
+	GPtrArray *entries = g_ptr_array_new();
+	int res;
+
+	t_responder_init(&ra);
+	ra.reorder_readdir = 1;
+	if (t_session_start(conn, &ra) == -1)
+		return t_fail("could not start the session");
+	buf_init(&handle, 0);
+	buf_add_string(&handle, "directory");
+	res = sftp_readdir_async(conn, &handle, entries, t_connver(conn));
+	buf_free(&handle);
+	if (res != 0 || entries->len != 0 ||
+	    t_responder_seen(&ra, SSH_FXP_READDIR) != READDIR_START)
+		return t_fail("readdir did not drain the pipelined replies");
+	g_ptr_array_free(entries, TRUE);
+	if (t_session_drop(conn, &ra) == -1 || !t_idle())
+		return t_fail("requests left behind");
+	return 0;
+}
+
 static void t_record_completed_reply(struct request *req)
 {
 	int *replied = req->data;
@@ -640,8 +960,9 @@ static void *t_failed_reply_sender(void *data)
 	buf_init(&buf, 0);
 	buf_add_string(&buf, "file");
 	buf_to_iov(&buf, &iov);
-	sftp_request_send(&sshfs.conns[0], SSH_FXP_STAT, &iov, 1, NULL,
-			  t_record_completed_reply, 1, data, &req);
+	sftp_request_send_connver(&sshfs.conns[0], CONNVER_ANY, SSH_FXP_STAT,
+				  &iov, 1, NULL, t_record_completed_reply,
+				  1, data, &req);
 	sftp_request_wait(req, SSH_FXP_STAT, SSH_FXP_ATTRS, NULL);
 	buf_free(&buf);
 	return NULL;
@@ -690,7 +1011,7 @@ static int t_test_failed_sender_waits_for_reply_completion(void)
 	pthread_mutex_unlock(&sshfs.lock);
 
 	/* Inject the reply before letting the queued write fail. */
-	t_reply_status(ra.fd, id);
+	t_reply_status(ra.fd, id, SSH_FX_NO_SUCH_FILE);
 	if (t_wait_until(t_reader_paused, NULL) == -1)
 		return t_fail("reader did not process the reply");
 	shutdown(conn->wfd, SHUT_WR);
@@ -710,9 +1031,11 @@ static int t_test_failed_sender_waits_for_reply_completion(void)
 int main(void)
 {
 	int i;
+	static char base_path[] = "";
 
 	alarm(T_TIMEOUT_SECS);
 
+	sshfs.base_path = base_path;
 	sshfs.max_conns = T_MAX_CONNS;
 	sshfs.conns = g_new0(struct conn, T_MAX_CONNS);
 	for (i = 0; i < T_MAX_CONNS; i++) {
@@ -734,6 +1057,18 @@ int main(void)
 	if (t_test_waiting_senders_are_not_stranded() != 0)
 		return 1;
 	if (t_test_waiting_sender_gives_up_with_its_connection() != 0)
+		return 1;
+	if (t_test_stale_request_not_sent_to_new_session() != 0)
+		return 1;
+	if (t_test_blocked_writer_is_released() != 0)
+		return 1;
+	if (t_test_dup_failure_is_refunded() != 0)
+		return 1;
+	if (t_test_failed_read_is_an_error() != 0)
+		return 1;
+	if (t_test_fstat_workaround_keeps_session() != 0)
+		return 1;
+	if (t_test_readdir_drains_completed_reply() != 0)
 		return 1;
 	if (t_test_failed_sender_waits_for_reply_completion() != 0)
 		return 1;
