@@ -2513,7 +2513,6 @@ static int sftp_readdir_async(struct conn *conn, struct buffer *handle,
 			}
 			if (!done) {
 				err = buf_get_entries(&name, entries);
-				buf_free(&name);
 
 				/* increase number of outstanding requests */
 				if (max < READDIR_MAX)
@@ -2522,6 +2521,8 @@ static int sftp_readdir_async(struct conn *conn, struct buffer *handle,
 				if (err)
 					done = 1;
 			}
+			if (!tmperr)
+				buf_free(&name);
 		}
 	}
 	assert(list == NULL);

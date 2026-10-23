@@ -36,6 +36,7 @@ struct t_responder {
 	int hold;		/* delay the answers until released */
 	unsigned nseen;		/* request types received, apart from INIT */
 	uint8_t seen[T_MAX_SEEN];
+	int reorder_readdir;	/* return a later NAME before an earlier EOF */
 };
 
 static int t_fail(const char *msg)
@@ -98,17 +99,28 @@ static void t_reply_version(int fd)
 	(void) t_write_full(fd, msg, sizeof(msg));
 }
 
-/* STATUS: no such file, empty message and language tag */
-static void t_reply_status(int fd, uint32_t id)
+/* STATUS with an empty message and language tag */
+static void t_reply_status(int fd, uint32_t id, uint32_t status)
 {
 	uint8_t msg[21];
 
 	t_put_be32(msg, 17);
 	msg[4] = SSH_FXP_STATUS;
 	t_put_be32(msg + 5, id);
-	t_put_be32(msg + 9, SSH_FX_NO_SUCH_FILE);
+	t_put_be32(msg + 9, status);
 	t_put_be32(msg + 13, 0);
 	t_put_be32(msg + 17, 0);
+	(void) t_write_full(fd, msg, sizeof(msg));
+}
+
+static void t_reply_empty_name(int fd, uint32_t id)
+{
+	uint8_t msg[13];
+
+	t_put_be32(msg, 9);
+	msg[4] = SSH_FXP_NAME;
+	t_put_be32(msg + 5, id);
+	t_put_be32(msg + 9, 0);
 	(void) t_write_full(fd, msg, sizeof(msg));
 }
 
@@ -117,6 +129,8 @@ static void *t_responder_main(void *data)
 	struct t_responder *r = data;
 	uint8_t hdr[4];
 	uint8_t body[4096];
+	unsigned readdir_count = 0;
+	uint32_t eof_id = 0;
 
 	for (;;) {
 		uint32_t len;
@@ -143,7 +157,17 @@ static void *t_responder_main(void *data)
 			pthread_cond_wait(&r->cond, &r->lock);
 		pthread_mutex_unlock(&r->lock);
 
-		t_reply_status(r->fd, id);
+		if (r->reorder_readdir && body[0] == SSH_FXP_READDIR) {
+			readdir_count++;
+			if (readdir_count == 1)
+				eof_id = id;
+			else {
+				t_reply_empty_name(r->fd, id);
+				if (readdir_count == 2)
+					t_reply_status(r->fd, eof_id, SSH_FX_EOF);
+			}
+		} else
+			t_reply_status(r->fd, id, SSH_FX_NO_SUCH_FILE);
 	}
 	return NULL;
 }
@@ -830,6 +854,33 @@ static int t_test_fstat_workaround_keeps_session(void)
 	return 0;
 }
 
+/* The second reply is already complete when the first reports EOF. It must
+   be drained and freed even though its directory entries are not consumed. */
+static int t_test_readdir_drains_completed_reply(void)
+{
+	struct conn *conn = &sshfs.conns[0];
+	struct t_responder ra;
+	struct buffer handle;
+	GPtrArray *entries = g_ptr_array_new();
+	int res;
+
+	t_responder_init(&ra);
+	ra.reorder_readdir = 1;
+	if (t_session_start(conn, &ra) == -1)
+		return t_fail("could not start the session");
+	buf_init(&handle, 0);
+	buf_add_string(&handle, "directory");
+	res = sftp_readdir_async(conn, &handle, entries, t_connver(conn));
+	buf_free(&handle);
+	if (res != 0 || entries->len != 0 ||
+	    t_responder_seen(&ra, SSH_FXP_READDIR) != READDIR_START)
+		return t_fail("readdir did not drain the pipelined replies");
+	g_ptr_array_free(entries, TRUE);
+	if (t_session_drop(conn, &ra) == -1 || !t_idle())
+		return t_fail("requests left behind");
+	return 0;
+}
+
 int main(void)
 {
 	int i;
@@ -869,6 +920,8 @@ int main(void)
 	if (t_test_failed_read_is_an_error() != 0)
 		return 1;
 	if (t_test_fstat_workaround_keeps_session() != 0)
+		return 1;
+	if (t_test_readdir_drains_completed_reply() != 0)
 		return 1;
 
 	return 0;
