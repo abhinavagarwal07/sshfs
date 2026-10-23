@@ -386,8 +386,7 @@ static int cache_readdir(const char *path, void *buf, fuse_fill_dir_t filler,
 	struct node *node;
 	struct cache_dirent **cdent;
 
-	/* A directory removed or replaced through this mount has no path and
-	 * had to be empty: list it as empty. */
+	/* Removed or replaced through this mount, so it had to be empty */
 	if (path == NULL)
 		return 0;
 
