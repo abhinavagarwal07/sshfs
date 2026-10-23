@@ -361,36 +361,43 @@ def test_write_error_reported(tmpdir):
         assert all(e.errno == errno.EIO for e in errors), errors
 
 
-@pytest.mark.xfail(
-    strict=True,
-    raises=KnownBug,
-    reason="sshfs_write_end() ignores a malformed WRITE reply (fix pending in upstream PR 391)",
-)
-@pytest.mark.parametrize("how", ["close", "fsync", "sshfs_sync"])
-@pytest.mark.parametrize("reply", ["wrong_type", "truncated"])
-def test_malformed_write_reply(tmpdir, reply, how):
-    """A reply to WRITE that is not a complete STATUS is an I/O error.
+def errno_of(step):
+    """The errno a call fails with, 0 if it succeeds."""
+    try:
+        step()
+    except OSError as exc:
+        return exc.errno
+    return 0
 
-    Writes are asynchronous, so the error comes out of fsync() or close();
-    with -o sshfs_sync, out of write() itself.
+
+@pytest.mark.parametrize("how", ["fsync", "close", "sshfs_sync"])
+@pytest.mark.parametrize("reply", [None, "wrong_type", "truncated"], ids=["valid", "wrong_type", "truncated"])
+def test_malformed_write_reply(tmpdir, reply, how):
+    """A reply to WRITE that is not a complete STATUS is an I/O error, reported
+    where the write is: write() with -o sshfs_sync, otherwise the fsync() or
+    close() after it, since writes are asynchronous. A good reply is the control.
     """
+    data = bytes(range(256)) * 16  # one WRITE request
     opts = ["sshfs_sync"] if how == "sshfs_sync" else []
-    with mock_mount(tmpdir, {"write_reply": reply}, opts, stderr_ok=("protocol error",)) as m:
+    # (write, fsync, close): the error shows up in one place only
+    expected = {"fsync": (0, errno.EIO, 0), "close": (0, 0, errno.EIO),
+                "sshfs_sync": (errno.EIO, 0, 0)}[how] if reply else (0, 0, 0)
+    stderr_ok = ("protocol error",) if reply == "wrong_type" else ()
+    with mock_mount(tmpdir, {"write_reply": reply} if reply else {}, opts, stderr_ok=stderr_ok) as m:
         fd = os.open(pjoin(m.mnt, "f"), os.O_WRONLY | os.O_CREAT, 0o644)
-        errors = []
-        steps = [lambda: os.write(fd, os.urandom(50000))]
-        if how == "fsync":
-            steps.append(lambda: os.fsync(fd))
-        steps.append(lambda: os.close(fd))
-        for step in steps:
-            try:
-                step()
-            except OSError as exc:
-                errors.append(exc)
-        assert m.stats().get("injected", 0) > 0, "mock never sent the bad reply"
-        if not errors:
-            raise KnownBug("write, fsync and close all succeeded")
-        assert all(e.errno == errno.EIO for e in errors), errors
+
+        def write():
+            assert os.write(fd, data) == len(data)
+
+        got = (
+            errno_of(write),
+            errno_of(lambda: os.fsync(fd)) if how == "fsync" else 0,
+            errno_of(lambda: os.close(fd)),
+        )
+        assert got == expected, f"errno of (write, fsync, close): {got}"
+        assert m.stats().get("injected", 0) == (1 if reply else 0)
+        if not reply:
+            assert read_file(pjoin(m.src, "f")) == data
 
 
 @pytest.mark.parametrize(
