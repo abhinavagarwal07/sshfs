@@ -1989,8 +1989,8 @@ static void *sshfs_init(struct fuse_conn_info *conn,
 	if (conn->capable & FUSE_CAP_ASYNC_READ)
 		sshfs.sync_read = 1;
 
-	/* Rewinding a directory needs its current path to reopen the SFTP
-	   handle, including after a rename through this mount. */
+	// readdir reopens directories at their current path, which may have
+	// changed since opendir
 	cfg->nullpath_ok = 0;
 
 	// Lookup of . and .. is supported
@@ -2504,6 +2504,14 @@ static int sshfs_readdir(const char *path, void *dbuf, fuse_fill_dir_t filler,
 	handle = (struct dir_handle*) fi->fh;
 
 	/*
+	 * path is NULL once the directory has been removed or replaced through
+	 * this mount. It had to be empty for that, so list it as empty rather
+	 * than reopen a path that may now name another directory.
+	 */
+	if (path == NULL)
+		return 0;
+
+	/*
 	 * offset == 0 starts a fresh enumeration (a new listing or a
 	 * rewinddir), so re-read the directory from the server to pick up newly
 	 * created files and updated attributes. The SFTP handle is single-pass:
@@ -2511,19 +2519,14 @@ static int sshfs_readdir(const char *path, void *dbuf, fuse_fill_dir_t filler,
 	 * would appear empty, so we reopen a fresh handle first. offset != 0 is
 	 * a continuation of the current enumeration and is served from the
 	 * snapshot taken at offset 0.
+	 * The handle is also tied to the path it was opened with: OpenSSH
+	 * resolves each entry as that path plus the name, so after a rename an
+	 * unread handle would list nothing. Reopen it at the current path.
 	 * See: https://github.com/libfuse/sshfs/issues/338
 	 */
-	/* FUSE can still pass NULL for an unlinked directory. In that case
-	   keep the snapshot: reopening the former path could read a different
-	   directory that has since been created there. SSHFS can submit READDIR
-	   on an unread SFTP handle without a local path. */
-	if (handle->entries == NULL || (offset == 0 && path != NULL)) {
-		/* OpenSSH also uses the OPENDIR path while processing READDIR.
-		   Reopen an unread handle if FUSE reports that it has moved. */
-		if (path != NULL &&
-		    (handle->buf_exhausted || !handle->has_handle ||
-		     handle->handle_path == NULL ||
-		     strcmp(path, handle->handle_path) != 0))
+	if (offset == 0 || handle->entries == NULL) {
+		if (handle->buf_exhausted || !handle->has_handle ||
+		    strcmp(path, handle->handle_path) != 0)
 			handle->read_err = sshfs_reopen_dir(handle, path);
 		if (!handle->read_err) {
 			if (handle->entries)

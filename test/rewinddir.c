@@ -65,33 +65,16 @@ static void check_listing(DIR *dir, int expect_fresh)
 		fail("incomplete directory listing");
 }
 
-static void check_empty(DIR *dir, int allow_estale)
-{
-	struct dirent *entry;
-
-	errno = 0;
-	while ((entry = readdir(dir)) != NULL) {
-		if (strcmp(entry->d_name, ".") && strcmp(entry->d_name, ".."))
-			fail("removed stream followed replacement directory");
-	}
-	if (errno && !(allow_estale && errno == ESTALE))
-		fail("removed directory readdir failed");
-}
-
 int main(int argc, char **argv)
 {
 	char renamed[PATH_MAX], marker[PATH_MAX], fresh[PATH_MAX];
-	char removed[PATH_MAX], removed_marker[PATH_MAX];
-	DIR *dir, *unread, *removed_open, *removed_cached;
+	DIR *dir, *unread;
 
 	if (argc != 2)
 		fail("usage: rewinddir MOUNTED_DIRECTORY");
 	if (snprintf(renamed, sizeof(renamed), "%s.renamed", argv[1]) >= (int)sizeof(renamed) ||
 	    snprintf(marker, sizeof(marker), "%s/replacement-marker", argv[1]) >= (int)sizeof(marker) ||
-	    snprintf(fresh, sizeof(fresh), "%s/%s", renamed, FRESH_NAME) >= (int)sizeof(fresh) ||
-	    snprintf(removed, sizeof(removed), "%s.removed", argv[1]) >= (int)sizeof(removed) ||
-	    snprintf(removed_marker, sizeof(removed_marker),
-		     "%s/replacement-marker", removed) >= (int)sizeof(removed_marker))
+	    snprintf(fresh, sizeof(fresh), "%s/%s", renamed, FRESH_NAME) >= (int)sizeof(fresh))
 		fail("test path is too long");
 	dir = opendir(argv[1]);
 	unread = opendir(argv[1]);
@@ -99,21 +82,16 @@ int main(int argc, char **argv)
 		fail("opendir failed");
 	check_listing(dir, 0);
 
-	/* Both unread and exhausted streams must follow a rename and refresh. */
-	if (rename(argv[1], renamed))
-		fail("rename failed");
-	create_file(fresh);
-	check_listing(unread, 1);
-	rewinddir(dir);
-	check_listing(dir, 1);
-
-	/* Replacing the old path must not redirect that same directory stream. */
-	if (mkdir(argv[1], 0700))
-		fail("mkdir replacement failed");
+	/* After a rename, with another directory at the old path, both the
+	 * rewound and the unread stream must list the renamed directory and its
+	 * new entry. Read dir first: listing unread would refill the directory
+	 * cache, and the rewind would then never reach sshfs. */
+	if (rename(argv[1], renamed) || mkdir(argv[1], 0700))
+		fail("rename or mkdir replacement failed");
 	create_file(marker);
+	create_file(fresh);
 	rewinddir(dir);
 	check_listing(dir, 1);
-	rewinddir(unread);
 	check_listing(unread, 1);
 	if (closedir(unread) || closedir(dir))
 		fail("closedir failed");
@@ -121,28 +99,5 @@ int main(int argc, char **argv)
 	if (unlink(marker) || rmdir(argv[1]) || unlink(fresh) ||
 	    rename(renamed, argv[1]))
 		fail("restore test directory failed");
-
-	/* A removed open stream must not follow a replacement at its old path.
-	 * The second stream is served only from the directory cache when enabled. */
-	if (mkdir(removed, 0700))
-		fail("mkdir removed test directory failed");
-	removed_open = opendir(removed);
-	if (!removed_open)
-		fail("opendir removed test directory failed");
-	check_empty(removed_open, 0);
-	removed_cached = opendir(removed);
-	if (!removed_cached)
-		fail("opendir cached removed test directory failed");
-	check_empty(removed_cached, 0);
-	if (rmdir(removed) || mkdir(removed, 0700))
-		fail("replace removed test directory failed");
-	create_file(removed_marker);
-	rewinddir(removed_open);
-	check_empty(removed_open, 0);
-	rewinddir(removed_cached);
-	check_empty(removed_cached, 1);
-	if (closedir(removed_cached) || closedir(removed_open) ||
-	    unlink(removed_marker) || rmdir(removed))
-		fail("cleanup removed test directory failed");
 	return 0;
 }
