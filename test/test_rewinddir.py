@@ -1,4 +1,4 @@
-"""An open directory must survive rename when rewinddir refreshes its listing."""
+"""Directory streams must support rewind and same-stream seek operations."""
 
 from pathlib import Path
 import subprocess
@@ -11,9 +11,10 @@ from util import cleanup, fuse_test_marker, umount
 pytestmark = fuse_test_marker()
 
 
+@pytest.mark.parametrize("operation", ["rename", "rewind-eof", "rewind-partial", "seek"])
 @pytest.mark.parametrize("dir_cache", ["yes", "no"])
 @pytest.mark.parametrize("sync_readdir", [False, True])
-def test_rewinddir_after_rename(tmpdir, dir_cache, sync_readdir, capfd):
+def test_directory_stream(tmpdir, operation, dir_cache, sync_readdir, capfd):
     capfd.register_output(r"^Warning: Permanently added 'localhost' .+", count=0)
     options = [f"dir_cache={dir_cache}"]
     if sync_readdir:
@@ -27,7 +28,7 @@ def test_rewinddir_after_rename(tmpdir, dir_cache, sync_readdir, capfd):
             (entries / (f"file-{i:06d}-" + "0" * 160)).touch()
         subprocess.run(
             [str(Path(__file__).with_name("rewinddir")),
-             str(Path(mnt_dir) / "entries")],
+             str(Path(mnt_dir) / "entries"), operation],
             check=True, timeout=30,
         )
     except BaseException:
