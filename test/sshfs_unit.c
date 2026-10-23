@@ -427,7 +427,6 @@ static int t_test_failed_send_is_refunded(void)
 	if (t_session_wait_dead(conn))
 		return t_fail("the connection was torn down before the send "
 			      "failed");
-			      "failed");
 	if (job.res != -EIO)
 		return t_fail("failed send was not reported");
 	if (!t_idle())
