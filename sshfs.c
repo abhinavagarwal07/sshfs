@@ -1535,10 +1535,12 @@ static void chunk_put_locked(struct read_chunk *chunk)
 /* Called with sshfs.lock held, once for every request that was counted */
 static void subtract_outstanding_locked(size_t len)
 {
-	if (len > sshfs.outstanding_len)
+	if (len > sshfs.outstanding_len) {
+		fprintf(stderr, "outstanding byte count out of step\n");
 		sshfs.outstanding_len = 0;
-	else
+	} else {
 		sshfs.outstanding_len -= len;
+	}
 
 	pthread_cond_broadcast(&sshfs.outstanding_cond);
 }
