@@ -4,12 +4,14 @@ on:
   push:
   pull_request:
   workflow_dispatch:
+  schedule:
+    - cron: '0 7 1 * *'
 
 permissions:
   contents: read
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
 jobs:
@@ -123,6 +125,161 @@ jobs:
         with:
           name: build-logs-alpine-musl
           path: build-alpine/meson-logs/
+
+  # quay.io garbage-collects old digests within weeks, so CentOS is a plain tag.
+  # meson and ninja-build are only in CRB on EL9.
+  rpm-build:
+    name: ${{ matrix.name }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: centos-stream9
+            image: quay.io/centos/centos:stream9
+            dnf_args: --enablerepo=crb
+          - name: fedora-latest
+            image: fedora:latest@sha256:43b29f65a41eb9c35e1cd5323e3bdf3b655c2357a9f4f1ff2f9c2798e5045d80
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Build in container
+        env:
+          IMAGE: ${{ matrix.image }}
+          DNF_ARGS: ${{ matrix.dnf_args }}
+        run: |
+          docker run --rm -e DNF_ARGS -v "$PWD:/work" -w /work "$IMAGE" sh -euxc '
+            dnf install -y $DNF_ARGS gcc meson ninja-build pkg-config glib2-devel fuse3-devel
+            meson setup build-rpm -Dwerror=true
+            ninja -C build-rpm
+          '
+
+      - name: Upload build logs
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: failure()
+        with:
+          name: build-logs-${{ matrix.name }}
+          path: build-rpm/meson-logs/
+
+  # Advisory: runs the pytest suite against real FUSE + sshd in a container with
+  # CAP_SYS_ADMIN. A failure here does not fail the workflow.
+  rpm-runtime:
+    name: ${{ matrix.name }} (runtime)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    continue-on-error: true
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: centos-stream9
+            image: quay.io/centos/centos:stream9
+            dnf_args: --enablerepo=crb
+          - name: fedora-latest
+            image: fedora:latest@sha256:43b29f65a41eb9c35e1cd5323e3bdf3b655c2357a9f4f1ff2f9c2798e5045d80
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Build and test in container
+        env:
+          IMAGE: ${{ matrix.image }}
+          DNF_ARGS: ${{ matrix.dnf_args }}
+        run: |
+          # FUSE mounts need CAP_SYS_ADMIN and no AppArmor profile, not --privileged
+          docker run --rm --cap-add SYS_ADMIN --security-opt apparmor=unconfined \
+            --device /dev/fuse -e DNF_ARGS \
+            -v "$PWD:/work" -w /work "$IMAGE" sh -euxc '
+            # which: test/util.py runs it, and the Fedora image does not ship it
+            dnf install -y $DNF_ARGS gcc meson ninja-build pkg-config glib2-devel fuse3-devel \
+              fuse3 openssh-server openssh-clients python3-pip which sudo
+            pip3 install pytest pytest-timeout
+            # test/util.py looks for the legacy name and skips the mount tests without it
+            command -v fusermount || ln -s "$(command -v fusermount3)" /usr/bin/fusermount
+            # build and test as the owner of the bind mount, like the runner on the Ubuntu jobs
+            useradd -m -u "$(stat -c %u /work)" -G wheel tester
+            usermod -p "*" tester
+            # passwordless sudo, as on the Ubuntu runner; some tests mount a tmpfs with it
+            echo "tester ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/tester
+            chmod 440 /etc/sudoers.d/tester
+            runuser -l tester -c "cd /work && meson setup build-rpm && ninja -C build-rpm"
+            install -d -m 700 -o tester /home/tester/.ssh
+            runuser -u tester -- ssh-keygen -t ed25519 -f /home/tester/.ssh/id_ed25519 -q -N ""
+            install -m 600 -o tester /home/tester/.ssh/id_ed25519.pub /home/tester/.ssh/authorized_keys
+            ssh-keygen -A
+            touch /work/build-rpm/sshd.log
+            chmod 644 /work/build-rpm/sshd.log
+            # the PAM account check fails in these containers (pam_acct_mgmt returns 9)
+            /usr/sbin/sshd -E /work/build-rpm/sshd.log -o LogLevel=VERBOSE -o UsePAM=no
+            ls -l "$(command -v fusermount3)" /dev/fuse
+            runuser -l tester -c "sudo -n true"
+            runuser -l tester -c "ssh -o ConnectionAttempts=10 -o StrictHostKeyChecking=no -o BatchMode=yes localhost true" || {
+              runuser -l tester -c "ssh -v -o StrictHostKeyChecking=no -o BatchMode=yes localhost true" || true
+              cat /work/build-rpm/sshd.log
+              exit 1
+            }
+            runuser -l tester -c "cd /work/build-rpm && python3 -m pytest test/ --timeout=300 --maxfail=99 --junitxml=test-results.xml"
+          '
+
+      # A missing FUSE prerequisite makes the mount tests skip, not fail.
+      - name: Check mount tests ran and none were skipped
+        run: |
+          python3 - build-rpm/test-results.xml <<'EOF'
+          import sys
+          import xml.etree.ElementTree as ET
+          root = ET.parse(sys.argv[1]).getroot()
+          # test_sshfs[...] mounts; the hostname and bad-reply tests pass without FUSE
+          ran = sum(
+              c.get("name", "").startswith("test_sshfs[") and c.find("skipped") is None
+              for c in root.iter("testcase")
+          )
+          # xfail is reported as skipped too, but it is not a missing prerequisite
+          skipped = sum(1 for s in root.iter("skipped") if s.get("type") != "pytest.xfail")
+          print(f"{ran} mount tests ran, {skipped} skipped")
+          if ran == 0 or skipped:
+              print(f"::error::{ran} mount tests ran, {skipped} skipped")
+              sys.exit(1)
+          EOF
+
+      - name: Note advisory failure
+        if: failure()
+        run: echo "::warning::${{ matrix.name }} runtime tests failed (advisory, not blocking)"
+
+      - name: Upload test results
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: test-results-${{ matrix.name }}
+          path: |
+            build-rpm/test-results.xml
+            build-rpm/sshd.log
+            build-rpm/meson-logs/
+
+  fedora-rawhide:
+    name: fedora-rawhide
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Build in Fedora Rawhide container
+        run: |
+          docker run --rm -v "$PWD:/work" -w /work registry.fedoraproject.org/fedora:rawhide sh -euxc '
+            dnf install -y gcc meson ninja-build pkg-config glib2-devel fuse3-devel
+            meson setup build-rawhide -Dwerror=true
+            ninja -C build-rawhide
+          '
+
+      - name: Upload build logs
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: failure()
+        with:
+          name: build-logs-fedora-rawhide
+          path: build-rawhide/meson-logs/
 
   freebsd:
     name: freebsd-14
