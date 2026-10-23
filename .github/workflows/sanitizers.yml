@@ -80,7 +80,7 @@ jobs:
         run: |
           mkdir -p "$RUNNER_TEMP/sanitizer"
           cd build
-          python3 -m pytest test/ --timeout=180 --maxfail=99 --junitxml=test-results.xml
+          python3 -m pytest test/ --timeout=180 --maxfail=99 --junitxml=test-results.xml --sshfs-no-skips
         timeout-minutes: 20
 
       # Some tests expect sshfs to fail and only look at its exit status, so
@@ -99,20 +99,6 @@ jobs:
             echo "::error::${#reports[@]} sanitizer report(s)"
             exit 1
           fi
-
-      # A missing FUSE prerequisite makes the mount tests skip, not fail.
-      - name: Check no tests were skipped
-        run: |
-          python3 - build/test-results.xml <<'EOF'
-          import sys
-          import xml.etree.ElementTree as ET
-          root = ET.parse(sys.argv[1]).getroot()
-          suites = [root] if root.tag == "testsuite" else root.findall("testsuite")
-          skipped = sum(int(s.get("skipped", 0)) for s in suites)
-          if skipped:
-              print(f"::error::{skipped} test(s) were skipped")
-              sys.exit(1)
-          EOF
 
       - name: Upload test results
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
