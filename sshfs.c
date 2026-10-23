@@ -1532,6 +1532,19 @@ static void chunk_put_locked(struct read_chunk *chunk)
 	pthread_mutex_unlock(&sshfs.lock);
 }
 
+/* Called with sshfs.lock held, once for every request that was counted */
+static void subtract_outstanding_locked(size_t len)
+{
+	if (len > sshfs.outstanding_len) {
+		fprintf(stderr, "outstanding byte count out of step\n");
+		sshfs.outstanding_len = 0;
+	} else {
+		sshfs.outstanding_len -= len;
+	}
+
+	pthread_cond_broadcast(&sshfs.outstanding_cond);
+}
+
 static int clean_req(void *key, struct request *req, gpointer user_data)
 {
 	(void) key;
@@ -1540,6 +1553,7 @@ static int clean_req(void *key, struct request *req, gpointer user_data)
 	if (req->conn != conn)
 		return FALSE;
 
+	subtract_outstanding_locked(req->len);
 	req->error = -EIO;
 	if (req->want_reply)
 		sem_post(&req->ready);
@@ -1574,17 +1588,9 @@ static int process_one_request(struct conn *conn)
 	if (req == NULL)
 		fprintf(stderr, "request %i not found\n", id);
 	else {
-		int was_over;
-
-		was_over = sshfs.outstanding_len > sshfs.max_outstanding_len;
-		sshfs.outstanding_len -= req->len;
-		if (was_over &&
-		    sshfs.outstanding_len <= sshfs.max_outstanding_len) {
-			pthread_cond_broadcast(&sshfs.outstanding_cond);
-		}
+		subtract_outstanding_locked(req->len);
 		g_hash_table_remove(sshfs.reqtab, GUINT_TO_POINTER(id));
 	}
-	pthread_mutex_unlock(&sshfs.lock);
 	if (req != NULL) {
 		if (sshfs.debug) {
 			struct timeval now;
@@ -1610,13 +1616,12 @@ static int process_one_request(struct conn *conn)
 		req->replied = 1;
 		if (req->want_reply)
 			sem_post(&req->ready);
-		else {
-			pthread_mutex_lock(&sshfs.lock);
+		else
 			request_free(req);
-			pthread_mutex_unlock(&sshfs.lock);
-		}
 	} else
 		buf_free(&buf);
+	/* A failed sender can free req once it is no longer in the table. */
+	pthread_mutex_unlock(&sshfs.lock);
 
 	return 0;
 }
@@ -1651,9 +1656,9 @@ static void *process_requests(void *data_)
 	pthread_mutex_lock(&sshfs.lock);
 	conn->processing_thread_started = 0;
 	close_conn(conn);
+	/* gives back the bytes of this connection's requests, not others' */
 	g_hash_table_foreach_remove(sshfs.reqtab, (GHRFunc) clean_req, conn);
 	conn->connver = ++sshfs.connvers;
-	sshfs.outstanding_len = 0;
 	pthread_cond_broadcast(&sshfs.outstanding_cond);
 	pthread_mutex_unlock(&sshfs.lock);
 
@@ -2076,6 +2081,7 @@ static int sftp_request_send(struct conn *conn, uint8_t type, struct iovec *iov,
 			     int want_reply, void *data, struct request **reqp)
 {
 	int err;
+	int connver;
 	uint32_t id;
 	struct request *req = g_new0(struct request, 1);
 
@@ -2096,10 +2102,22 @@ static int sftp_request_send(struct conn *conn, uint8_t type, struct iovec *iov,
 		pthread_mutex_unlock(&sshfs.lock);
 		goto out;
 	}
+	connver = conn->connver;
 	req->len = iov_length(iov, count) + 9;
-	sshfs.outstanding_len += req->len;
-	while (sshfs.outstanding_len > sshfs.max_outstanding_len)
+	/*
+	 * Only requests in the table are counted, so one that waits for room
+	 * has nothing to give back if its connection goes away meanwhile. It
+	 * must not go on waiting then, as the room may be held by another
+	 * connection.
+	 */
+	while (sshfs.outstanding_len &&
+	       (uint64_t) sshfs.outstanding_len + req->len >
+	       sshfs.max_outstanding_len) {
 		pthread_cond_wait(&sshfs.outstanding_cond, &sshfs.lock);
+		if (conn->connver != connver)
+			goto out_unlock;
+	}
+	sshfs.outstanding_len += req->len;
 
 	g_hash_table_insert(sshfs.reqtab, GUINT_TO_POINTER(id), req);
 	if (sshfs.debug) {
@@ -2116,6 +2134,8 @@ static int sftp_request_send(struct conn *conn, uint8_t type, struct iovec *iov,
 
 		pthread_mutex_lock(&sshfs.lock);
 		rmed = g_hash_table_remove(sshfs.reqtab, GUINT_TO_POINTER(id));
+		if (rmed)
+			subtract_outstanding_locked(req->len);
 		pthread_mutex_unlock(&sshfs.lock);
 
 		if (!rmed && !want_reply) {
@@ -2128,6 +2148,9 @@ static int sftp_request_send(struct conn *conn, uint8_t type, struct iovec *iov,
 		*reqp = req;
 	return 0;
 
+out_unlock:
+	pthread_mutex_unlock(&sshfs.lock);
+	err = -EIO;
 out:
 	req->error = err;
 	if (!want_reply)

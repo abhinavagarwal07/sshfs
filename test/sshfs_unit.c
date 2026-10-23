@@ -1,0 +1,742 @@
+/*
+ * Tests for the connection handling in sshfs.c.  They need neither a mount
+ * nor ssh: sshfs.c is #included so that its static functions and global state
+ * can be driven directly, and a "connection" is a socketpair with a tiny SFTP
+ * responder thread on the far end.  Dropping a connection is shutdown() on the
+ * responder's end.
+ *
+ * Everything here is prefixed t_ because it shares a translation unit with
+ * sshfs.c.  Failures are reported on stderr and make the test exit non-zero.
+ */
+
+#define _GNU_SOURCE
+#include <glib.h>
+#include <pthread.h>
+#include <stdint.h>
+
+static gboolean t_hash_table_remove(GHashTable *table, gconstpointer key);
+static int t_mutex_unlock(pthread_mutex_t *mutex);
+
+#ifdef __APPLE__
+int sshfs_main(int argc, char *argv[], char *envp[], char **exec_path);
+#else
+int sshfs_main(int argc, char *argv[]);
+#endif
+#define main sshfs_main
+#define g_hash_table_remove t_hash_table_remove
+#define pthread_mutex_unlock t_mutex_unlock
+#include "../sshfs.c"
+#undef pthread_mutex_unlock
+#undef g_hash_table_remove
+#undef main
+
+/* Pause the reader just after it releases the table lock for one reply. This
+   lets a failed sender finish while the reader is still on that stack frame. */
+static struct {
+	pthread_mutex_t lock;
+	pthread_cond_t cond;
+	uint32_t id;
+	pthread_t reader;
+	int armed;
+	int removed;
+	int paused;
+	int released;
+} t_reply_gate = { .lock = PTHREAD_MUTEX_INITIALIZER,
+		   .cond = PTHREAD_COND_INITIALIZER };
+
+static gboolean t_hash_table_remove(GHashTable *table, gconstpointer key)
+{
+	gboolean removed = g_hash_table_remove(table, key);
+
+	pthread_mutex_lock(&t_reply_gate.lock);
+	if (removed && table == sshfs.reqtab && t_reply_gate.armed &&
+	    GPOINTER_TO_UINT(key) == t_reply_gate.id) {
+		t_reply_gate.reader = pthread_self();
+		t_reply_gate.removed = 1;
+	}
+	pthread_mutex_unlock(&t_reply_gate.lock);
+	return removed;
+}
+
+static int t_mutex_unlock(pthread_mutex_t *mutex)
+{
+	int pause;
+	int res;
+
+	pthread_mutex_lock(&t_reply_gate.lock);
+	pause = mutex == &sshfs.lock && t_reply_gate.armed &&
+		t_reply_gate.removed &&
+		pthread_equal(pthread_self(), t_reply_gate.reader);
+	if (pause)
+		t_reply_gate.armed = 0;
+	pthread_mutex_unlock(&t_reply_gate.lock);
+	res = pthread_mutex_unlock(mutex);
+	if (pause) {
+		pthread_mutex_lock(&t_reply_gate.lock);
+		t_reply_gate.paused = 1;
+		pthread_cond_broadcast(&t_reply_gate.cond);
+		while (!t_reply_gate.released)
+			pthread_cond_wait(&t_reply_gate.cond, &t_reply_gate.lock);
+		pthread_mutex_unlock(&t_reply_gate.lock);
+	}
+	return res;
+}
+
+#define T_MAX_CONNS 2
+#define T_MAX_SEEN 32
+
+/* Something that goes wrong in a test should end it, not hang it. This is
+   less than the 30 seconds meson allows a test. */
+#define T_TIMEOUT_SECS 25
+
+struct t_responder {
+	int fd;
+	pthread_t thread;
+	pthread_mutex_t lock;
+	pthread_cond_t cond;
+	int hold;		/* delay the answers until released */
+	unsigned nseen;		/* request types received, apart from INIT */
+	uint8_t seen[T_MAX_SEEN];
+};
+
+static int t_fail(const char *msg)
+{
+	fprintf(stderr, "FAIL: %s\n", msg);
+	return 1;
+}
+
+static uint32_t t_get_be32(const uint8_t *p)
+{
+	return ((uint32_t) p[0] << 24) | ((uint32_t) p[1] << 16) |
+	       ((uint32_t) p[2] << 8) | (uint32_t) p[3];
+}
+
+static void t_put_be32(uint8_t *p, uint32_t v)
+{
+	p[0] = v >> 24;
+	p[1] = v >> 16;
+	p[2] = v >> 8;
+	p[3] = v;
+}
+
+static int t_read_full(int fd, uint8_t *p, size_t len)
+{
+	while (len) {
+		ssize_t n = read(fd, p, len);
+
+		if (n < 0 && errno == EINTR)
+			continue;
+		if (n <= 0)
+			return -1;
+		p += n;
+		len -= n;
+	}
+	return 0;
+}
+
+static int t_write_full(int fd, const uint8_t *p, size_t len)
+{
+	while (len) {
+		ssize_t n = write(fd, p, len);
+
+		if (n < 0 && errno == EINTR)
+			continue;
+		if (n <= 0)
+			return -1;
+		p += n;
+		len -= n;
+	}
+	return 0;
+}
+
+static void t_reply_version(int fd)
+{
+	uint8_t msg[9];
+
+	t_put_be32(msg, 5);
+	msg[4] = SSH_FXP_VERSION;
+	t_put_be32(msg + 5, PROTO_VERSION);
+	(void) t_write_full(fd, msg, sizeof(msg));
+}
+
+/* STATUS: no such file, empty message and language tag */
+static void t_reply_status(int fd, uint32_t id)
+{
+	uint8_t msg[21];
+
+	t_put_be32(msg, 17);
+	msg[4] = SSH_FXP_STATUS;
+	t_put_be32(msg + 5, id);
+	t_put_be32(msg + 9, SSH_FX_NO_SUCH_FILE);
+	t_put_be32(msg + 13, 0);
+	t_put_be32(msg + 17, 0);
+	(void) t_write_full(fd, msg, sizeof(msg));
+}
+
+static void *t_responder_main(void *data)
+{
+	struct t_responder *r = data;
+	uint8_t hdr[4];
+	uint8_t body[4096];
+
+	for (;;) {
+		uint32_t len;
+		uint32_t id;
+
+		if (t_read_full(r->fd, hdr, sizeof(hdr)) == -1)
+			break;
+		len = t_get_be32(hdr);
+		if (len < 1 || len > sizeof(body))
+			break;
+		if (t_read_full(r->fd, body, len) == -1)
+			break;
+
+		if (body[0] == SSH_FXP_INIT) {
+			t_reply_version(r->fd);
+			continue;
+		}
+		id = len >= 5 ? t_get_be32(body + 1) : 0;
+
+		pthread_mutex_lock(&r->lock);
+		if (r->nseen < T_MAX_SEEN)
+			r->seen[r->nseen++] = body[0];
+		while (r->hold)
+			pthread_cond_wait(&r->cond, &r->lock);
+		pthread_mutex_unlock(&r->lock);
+
+		t_reply_status(r->fd, id);
+	}
+	return NULL;
+}
+
+static void t_responder_init(struct t_responder *r)
+{
+	memset(r, 0, sizeof(*r));
+	r->fd = -1;
+	pthread_mutex_init(&r->lock, NULL);
+	pthread_cond_init(&r->cond, NULL);
+}
+
+static void t_responder_hold(struct t_responder *r, int hold)
+{
+	pthread_mutex_lock(&r->lock);
+	r->hold = hold;
+	pthread_cond_broadcast(&r->cond);
+	pthread_mutex_unlock(&r->lock);
+}
+
+static unsigned t_responder_seen(struct t_responder *r, uint8_t type)
+{
+	unsigned i;
+	unsigned n = 0;
+
+	pthread_mutex_lock(&r->lock);
+	for (i = 0; i < r->nseen; i++)
+		if (r->seen[i] == type)
+			n++;
+	pthread_mutex_unlock(&r->lock);
+	return n;
+}
+
+/* Connect conn to a fresh responder, the way a (re)connect would */
+static int t_session_start(struct conn *conn, struct t_responder *r)
+{
+	int sv[2];
+	int err;
+
+	if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == -1)
+		return -1;
+	r->fd = sv[1];
+	if (pthread_create(&r->thread, NULL, t_responder_main, r) != 0) {
+		close(sv[0]);
+		close(sv[1]);
+		return -1;
+	}
+
+	pthread_mutex_lock(&sshfs.lock);
+	conn->rfd = sv[0];
+	conn->wfd = sv[0];
+	err = start_processing_thread(conn);
+	pthread_mutex_unlock(&sshfs.lock);
+	return err ? -1 : 0;
+}
+
+static int t_wait_until(int (*cond)(void *), void *arg)
+{
+	int i;
+
+	for (i = 0; i < T_TIMEOUT_SECS * 1000; i++) {
+		if (cond(arg))
+			return 0;
+		usleep(1000);
+	}
+	return -1;
+}
+
+/* The far end goes away; wait until sshfs has cleaned up after it */
+static int t_session_wait_dead(void *arg)
+{
+	struct conn *conn = arg;
+	int dead;
+
+	pthread_mutex_lock(&sshfs.lock);
+	dead = !conn->processing_thread_started;
+	pthread_mutex_unlock(&sshfs.lock);
+	return dead;
+}
+
+/* The socket is shut down first, so that held requests are failed by the
+   teardown instead of being answered */
+static int t_session_drop(struct conn *conn, struct t_responder *r)
+{
+	shutdown(r->fd, SHUT_RDWR);
+	t_responder_hold(r, 0);
+	pthread_join(r->thread, NULL);
+	close(r->fd);
+	r->fd = -1;
+	return t_wait_until(t_session_wait_dead, conn);
+}
+
+static int t_reqtab_size_is(void *arg)
+{
+	unsigned *want = arg;
+	int ok;
+
+	pthread_mutex_lock(&sshfs.lock);
+	ok = g_hash_table_size(sshfs.reqtab) == *want;
+	pthread_mutex_unlock(&sshfs.lock);
+	return ok;
+}
+
+/* A sender that has taken a request but not yet been admitted is counted
+   in req_count, and sleeps in the send window, never leaving the lock before */
+struct t_count {
+	struct conn *conn;
+	int want;
+};
+
+static int t_req_count_is(void *arg)
+{
+	struct t_count *c = arg;
+	int ok;
+
+	pthread_mutex_lock(&sshfs.lock);
+	ok = c->conn->req_count == c->want;
+	pthread_mutex_unlock(&sshfs.lock);
+	return ok;
+}
+
+static unsigned t_outstanding_len(void)
+{
+	unsigned len;
+
+	pthread_mutex_lock(&sshfs.lock);
+	len = sshfs.outstanding_len;
+	pthread_mutex_unlock(&sshfs.lock);
+	return len;
+}
+
+static int t_idle(void)
+{
+	int idle;
+
+	pthread_mutex_lock(&sshfs.lock);
+	idle = sshfs.outstanding_len == 0 &&
+	       g_hash_table_size(sshfs.reqtab) == 0;
+	pthread_mutex_unlock(&sshfs.lock);
+	return idle;
+}
+
+/* What a STAT request of this path length counts for: the string length, the
+   path, and the packet header */
+static unsigned t_wire_len(size_t pathlen)
+{
+	return pathlen + 4 + 9;
+}
+
+/* A request that expects an answer, run from its own thread */
+struct t_job {
+	struct conn *conn;
+	size_t pathlen;
+	uint8_t type;
+	uint8_t expect;
+	int res;
+};
+
+static void t_job_init(struct t_job *job, struct conn *conn, size_t pathlen)
+{
+	memset(job, 0, sizeof(*job));
+	job->conn = conn;
+	job->pathlen = pathlen;
+	job->type = SSH_FXP_STAT;
+	job->expect = SSH_FXP_ATTRS;
+}
+
+static void *t_job_thread(void *data)
+{
+	struct t_job *job = data;
+	struct buffer buf;
+	char *path = g_malloc0(job->pathlen + 1);
+
+	memset(path, 'x', job->pathlen);
+	buf_init(&buf, 0);
+	buf_add_string(&buf, path);
+	job->res = sftp_request(job->conn, job->type, &buf, job->expect, NULL);
+	buf_free(&buf);
+	g_free(path);
+	return NULL;
+}
+
+/*
+ * The accounting of outstanding bytes is shared by all connections. When one
+ * connection goes away only its own requests may be given back.
+ */
+static int t_test_teardown_keeps_other_connections(void)
+{
+	struct t_responder ra;
+	struct t_responder rb;
+	struct t_job ja;
+	struct t_job jb;
+	pthread_t ta;
+	pthread_t tb;
+	unsigned n;
+
+	t_responder_init(&ra);
+	t_responder_init(&rb);
+	t_job_init(&ja, &sshfs.conns[0], 20);
+	t_job_init(&jb, &sshfs.conns[1], 40);
+	if (t_session_start(&sshfs.conns[0], &ra) == -1 ||
+	    t_session_start(&sshfs.conns[1], &rb) == -1)
+		return t_fail("could not start the sessions");
+
+	/* One request pending on each connection */
+	t_responder_hold(&ra, 1);
+	t_responder_hold(&rb, 1);
+	if (pthread_create(&ta, NULL, t_job_thread, &ja) != 0)
+		return t_fail("pthread_create failed");
+	n = 1;
+	if (t_wait_until(t_reqtab_size_is, &n) == -1)
+		return t_fail("first request was not sent");
+	if (pthread_create(&tb, NULL, t_job_thread, &jb) != 0)
+		return t_fail("pthread_create failed");
+	n = 2;
+	if (t_wait_until(t_reqtab_size_is, &n) == -1)
+		return t_fail("second request was not sent");
+	if (t_outstanding_len() != t_wire_len(20) + t_wire_len(40))
+		return t_fail("requests were not counted");
+
+	/* Connection 1 drops: its request fails, the other one stays counted */
+	if (t_session_drop(&sshfs.conns[1], &rb) == -1)
+		return t_fail("connection 1 was not torn down");
+	pthread_join(tb, NULL);
+	if (jb.res != -EIO)
+		return t_fail("request of the lost connection did not fail");
+	if (t_outstanding_len() != t_wire_len(20))
+		return t_fail("tearing down one connection did not give back "
+			      "exactly its own requests");
+
+	t_responder_hold(&ra, 0);
+	pthread_join(ta, NULL);
+	if (ja.res != -ENOENT)
+		return t_fail("request did not get its answer");
+	if (t_outstanding_len() != 0)
+		return t_fail("outstanding bytes left over after the answer");
+
+	if (t_session_drop(&sshfs.conns[0], &ra) == -1)
+		return t_fail("connection 0 was not torn down");
+	if (!t_idle())
+		return t_fail("requests left behind");
+	return 0;
+}
+
+/* A request that cannot be sent has to give back what it counted */
+static int t_test_failed_send_is_refunded(void)
+{
+	struct t_responder ra;
+	struct conn *conn = &sshfs.conns[0];
+	struct t_job job;
+	pthread_t thread;
+	unsigned n = 1;
+
+	t_responder_init(&ra);
+	t_job_init(&job, conn, 10);
+	if (t_session_start(conn, &ra) == -1)
+		return t_fail("could not start the session");
+
+	/* Hold up the writer after the request has been counted and queued */
+	pthread_mutex_lock(&conn->lock_write);
+	if (pthread_create(&thread, NULL, t_job_thread, &job) != 0) {
+		pthread_mutex_unlock(&conn->lock_write);
+		return t_fail("pthread_create failed");
+	}
+	if (t_wait_until(t_reqtab_size_is, &n) == -1) {
+		pthread_mutex_unlock(&conn->lock_write);
+		return t_fail("request was not queued");
+	}
+	if (t_outstanding_len() != t_wire_len(10)) {
+		pthread_mutex_unlock(&conn->lock_write);
+		return t_fail("request was not counted");
+	}
+
+	/*
+	 * Writes fail from now on. The responder does not close its end when
+	 * it sees this, so the reader keeps waiting and cannot clean up first:
+	 * the sender is the one that has to give the request back.
+	 */
+	shutdown(conn->wfd, SHUT_WR);
+	pthread_mutex_unlock(&conn->lock_write);
+	pthread_join(thread, NULL);
+
+	if (t_session_wait_dead(conn))
+		return t_fail("the connection was torn down before the send "
+			      "failed");
+	if (job.res != -EIO)
+		return t_fail("failed send was not reported");
+	if (!t_idle())
+		return t_fail("failed send left its request counted");
+
+	if (t_session_drop(conn, &ra) == -1)
+		return t_fail("connection was not torn down");
+	if (t_responder_seen(&ra, SSH_FXP_STAT) != 0)
+		return t_fail("the failed request reached the server");
+	return 0;
+}
+
+/*
+ * With a limit on the bytes in flight, requests wait for room before they are
+ * counted. When the connection is lost they must not stay behind waiting for
+ * room that is no longer going to be freed by anything.
+ */
+static int t_test_waiting_senders_are_not_stranded(void)
+{
+	struct conn *conn = &sshfs.conns[0];
+	struct t_responder ra;
+	struct t_job jobs[3];
+	pthread_t threads[3];
+	struct t_count count = { .conn = conn };
+	unsigned n = 1;
+	int i;
+
+	/* The three requests are 80, 60 and 60 bytes: the second does not fit
+	   next to the first, the third not next to either */
+	size_t pathlen[3] = { 67, 47, 47 };
+
+	t_responder_init(&ra);
+	sshfs.max_outstanding_len = 100;
+	if (t_session_start(conn, &ra) == -1)
+		return t_fail("could not start the session");
+
+	t_responder_hold(&ra, 1);
+	for (i = 0; i < 3; i++) {
+		t_job_init(&jobs[i], conn, pathlen[i]);
+		if (pthread_create(&threads[i], NULL, t_job_thread,
+				   &jobs[i]) != 0)
+			return t_fail("pthread_create failed");
+
+		/* The first one is sent; the others are about to wait */
+		if (i == 0) {
+			if (t_wait_until(t_reqtab_size_is, &n) == -1)
+				return t_fail("first request was not sent");
+		} else {
+			count.want = i + 1;
+			if (t_wait_until(t_req_count_is, &count) == -1)
+				return t_fail("request was not taken");
+		}
+	}
+
+	/* Only the first request is in the table, and the only one counted */
+	n = 1;
+	if (t_outstanding_len() != t_wire_len(pathlen[0]) ||
+	    !t_reqtab_size_is(&n))
+		return t_fail("requests that wait for room were counted or "
+			      "sent");
+
+	if (t_session_drop(conn, &ra) == -1)
+		return t_fail("session was not torn down");
+	for (i = 0; i < 3; i++) {
+		pthread_join(threads[i], NULL);
+		if (jobs[i].res != -EIO)
+			return t_fail("request for a lost connection did not "
+				      "fail");
+	}
+
+	sshfs.max_outstanding_len = ~0U;
+	if (!t_idle())
+		return t_fail("requests left behind or still counted");
+	return 0;
+}
+
+/*
+ * A request that waits for room, because another connection is using it,
+ * must give up when its own connection is lost, rather than go back to sleep
+ * until the other connection frees the room.
+ */
+static int t_test_waiting_sender_gives_up_with_its_connection(void)
+{
+	struct t_responder ra;
+	struct t_responder rb;
+	struct t_job other;
+	struct t_job waiter;
+	struct t_count count = { .conn = &sshfs.conns[0], .want = 1 };
+	pthread_t tother;
+	pthread_t twaiter;
+	unsigned n = 1;
+
+	t_responder_init(&ra);
+	t_responder_init(&rb);
+	t_job_init(&other, &sshfs.conns[1], 67);	/* 80 bytes */
+	t_job_init(&waiter, &sshfs.conns[0], 47);	/* 60 bytes */
+	sshfs.max_outstanding_len = 100;
+	if (t_session_start(&sshfs.conns[0], &ra) == -1 ||
+	    t_session_start(&sshfs.conns[1], &rb) == -1)
+		return t_fail("could not start the sessions");
+
+	t_responder_hold(&rb, 1);
+	if (pthread_create(&tother, NULL, t_job_thread, &other) != 0)
+		return t_fail("pthread_create failed");
+	if (t_wait_until(t_reqtab_size_is, &n) == -1)
+		return t_fail("first request was not sent");
+	if (pthread_create(&twaiter, NULL, t_job_thread, &waiter) != 0)
+		return t_fail("pthread_create failed");
+	if (t_wait_until(t_req_count_is, &count) == -1)
+		return t_fail("second request was not taken");
+
+	/* Its connection goes away while the other one still holds the room */
+	if (t_session_drop(&sshfs.conns[0], &ra) == -1)
+		return t_fail("connection 0 was not torn down");
+	pthread_join(twaiter, NULL);
+	if (waiter.res != -EIO)
+		return t_fail("waiting request did not fail with its "
+			      "connection");
+	if (t_outstanding_len() != t_wire_len(67))
+		return t_fail("the lost connection changed the count of "
+			      "another one");
+
+	t_responder_hold(&rb, 0);
+	pthread_join(tother, NULL);
+	if (other.res != -ENOENT)
+		return t_fail("the other request did not get its answer");
+	if (t_session_drop(&sshfs.conns[1], &rb) == -1)
+		return t_fail("connection 1 was not torn down");
+	sshfs.max_outstanding_len = ~0U;
+	if (!t_idle())
+		return t_fail("requests left behind or still counted");
+	return 0;
+}
+
+static void t_record_completed_reply(struct request *req)
+{
+	int *replied = req->data;
+
+	*replied = req->replied;
+}
+
+static void *t_failed_reply_sender(void *data)
+{
+	struct buffer buf;
+	struct iovec iov;
+	struct request *req;
+
+	buf_init(&buf, 0);
+	buf_add_string(&buf, "file");
+	buf_to_iov(&buf, &iov);
+	sftp_request_send(&sshfs.conns[0], SSH_FXP_STAT, &iov, 1, NULL,
+			  t_record_completed_reply, 1, data, &req);
+	sftp_request_wait(req, SSH_FXP_STAT, SSH_FXP_ATTRS, NULL);
+	buf_free(&buf);
+	return NULL;
+}
+
+static int t_reader_paused(void *arg)
+{
+	int paused;
+
+	(void) arg;
+	pthread_mutex_lock(&t_reply_gate.lock);
+	paused = t_reply_gate.paused;
+	pthread_mutex_unlock(&t_reply_gate.lock);
+	return paused;
+}
+
+/* A reply and a failed write can race. A sender that finds its request already
+   removed must not free it while the reader is still completing the reply. */
+static int t_test_failed_sender_waits_for_reply_completion(void)
+{
+	struct conn *conn = &sshfs.conns[0];
+	struct t_responder ra;
+	pthread_t thread;
+	GHashTableIter iter;
+	gpointer key;
+	unsigned n = 1;
+	uint32_t id;
+	int replied = -1;
+
+	t_responder_init(&ra);
+	if (t_session_start(conn, &ra) == -1)
+		return t_fail("could not start the session");
+	pthread_mutex_lock(&conn->lock_write);
+	if (pthread_create(&thread, NULL, t_failed_reply_sender, &replied) != 0)
+		return t_fail("pthread_create failed");
+	if (t_wait_until(t_reqtab_size_is, &n) == -1)
+		return t_fail("request was not queued");
+	pthread_mutex_lock(&sshfs.lock);
+	g_hash_table_iter_init(&iter, sshfs.reqtab);
+	g_hash_table_iter_next(&iter, &key, NULL);
+	id = GPOINTER_TO_UINT(key);
+	pthread_mutex_lock(&t_reply_gate.lock);
+	t_reply_gate.id = id;
+	t_reply_gate.armed = 1;
+	pthread_mutex_unlock(&t_reply_gate.lock);
+	pthread_mutex_unlock(&sshfs.lock);
+
+	/* Inject the reply before letting the queued write fail. */
+	t_reply_status(ra.fd, id);
+	if (t_wait_until(t_reader_paused, NULL) == -1)
+		return t_fail("reader did not process the reply");
+	shutdown(conn->wfd, SHUT_WR);
+	pthread_mutex_unlock(&conn->lock_write);
+	pthread_join(thread, NULL);
+	if (replied != 1)
+		return t_fail("sender freed the request before its reply was complete");
+	pthread_mutex_lock(&t_reply_gate.lock);
+	t_reply_gate.released = 1;
+	pthread_cond_broadcast(&t_reply_gate.cond);
+	pthread_mutex_unlock(&t_reply_gate.lock);
+	if (t_session_drop(conn, &ra) == -1 || !t_idle())
+		return t_fail("requests left behind");
+	return 0;
+}
+
+int main(void)
+{
+	int i;
+
+	alarm(T_TIMEOUT_SECS);
+
+	sshfs.max_conns = T_MAX_CONNS;
+	sshfs.conns = g_new0(struct conn, T_MAX_CONNS);
+	for (i = 0; i < T_MAX_CONNS; i++) {
+		sshfs.conns[i].rfd = -1;
+		sshfs.conns[i].wfd = -1;
+	}
+	/* main() sets these; close_conn() would close fd 0 for a zero */
+	sshfs.ptyfd = -1;
+	sshfs.ptypassivefd = -1;
+	sshfs.reconnect = 1;
+	sshfs.max_outstanding_len = ~0U;
+	if (processing_init() == -1)
+		return t_fail("processing_init failed");
+
+	if (t_test_teardown_keeps_other_connections() != 0)
+		return 1;
+	if (t_test_failed_send_is_refunded() != 0)
+		return 1;
+	if (t_test_waiting_senders_are_not_stranded() != 0)
+		return 1;
+	if (t_test_waiting_sender_gives_up_with_its_connection() != 0)
+		return 1;
+	if (t_test_failed_sender_waits_for_reply_completion() != 0)
+		return 1;
+
+	return 0;
+}

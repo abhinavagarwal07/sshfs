@@ -16,6 +16,19 @@ test_cache = executable('test_cache', 'test_cache.c',
                         install: false)
 test('cache', test_cache, suite: 'unit')
 
+# Tests for the connection handling in sshfs.c.  The test #includes sshfs.c
+# itself, so that is not listed as a source.
+sshfs_unit_sources = ['sshfs_unit.c', '../cache.c']
+if target_machine.system() == 'darwin'
+  sshfs_unit_sources += [ '../compat/darwin_compat.c' ]
+endif
+sshfs_unit = executable('sshfs_unit', sshfs_unit_sources,
+                        include_directories: include_dirs,
+                        dependencies: sshfs_deps,
+                        c_args: ['-DFUSE_USE_VERSION=31'],
+                        install: false)
+test('sshfs_conn', sshfs_unit, suite: 'unit')
+
 # Provide something helpful when running 'ninja test'
 wrong_cmd = executable('wrong_command', 'wrong_command.c',
                        install: false)
