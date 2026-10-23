@@ -11,7 +11,9 @@ from util import cleanup, fuse_test_marker, umount
 pytestmark = fuse_test_marker()
 
 
-@pytest.mark.parametrize("operation", ["rename", "rewind-eof", "rewind-partial", "seek"])
+@pytest.mark.parametrize(
+    "operation", ["rename", "rewind-eof", "rewind-partial", "seek", "refresh"]
+)
 @pytest.mark.parametrize("dir_cache", ["yes", "no"])
 @pytest.mark.parametrize("sync_readdir", [False, True])
 def test_directory_stream(tmpdir, operation, dir_cache, sync_readdir, capfd):

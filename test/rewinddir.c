@@ -37,7 +37,7 @@ static int read_entry(DIR *dir)
 		}
 		if (!strcmp(entry->d_name, ".") || !strcmp(entry->d_name, ".."))
 			continue;
-		if (sscanf(entry->d_name, "file-%u-", &index) != 1 || index >= NFILES)
+		if (sscanf(entry->d_name, "file-%u-", &index) != 1 || index > NFILES)
 			fail("unexpected directory entry");
 		snprintf(expected, sizeof(expected), "file-%06u-%0160u", index, 0U);
 		if (strcmp(entry->d_name, expected))
@@ -46,18 +46,18 @@ static int read_entry(DIR *dir)
 	}
 }
 
-static void check_listing(DIR *dir)
+static void check_listing(DIR *dir, unsigned expected_count)
 {
-	int seen[NFILES] = { 0 };
+	int seen[NFILES + 1] = { 0 };
 	unsigned count = 0;
 	int index;
 
 	while ((index = read_entry(dir)) != -1) {
-		if (seen[index]++)
-			fail("duplicate directory entry");
+		if ((unsigned)index >= expected_count || seen[index]++)
+			fail("unexpected or duplicate directory entry");
 		count++;
 	}
-	if (count != NFILES)
+	if (count != expected_count)
 		fail("incomplete directory listing");
 }
 
@@ -69,7 +69,7 @@ static void check_seek(DIR *dir)
 	/* Save a cookie after several buffers, then read all the way to EOF. */
 	for (unsigned i = 0; i < NFILES; i++) {
 		entries[i] = read_entry(dir);
-		if (entries[i] == -1 || seen[entries[i]]++)
+		if (entries[i] == -1 || entries[i] >= NFILES || seen[entries[i]]++)
 			fail("incomplete or duplicate directory listing before seekdir");
 		if (i + 1 == NFILES / 2) {
 			position = telldir(dir);
@@ -88,6 +88,25 @@ static void check_seek(DIR *dir)
 		fail("extra directory entries after seekdir");
 }
 
+static void check_refresh(DIR *dir, const char *path)
+{
+	char added[PATH_MAX];
+	int fd;
+
+	if (snprintf(added, sizeof(added), "%s/file-%06u-%0160u", path,
+		     NFILES, 0U) >= (int)sizeof(added))
+		fail("test path is too long");
+	fd = open(added, O_WRONLY | O_CREAT | O_EXCL, 0600);
+	if (fd == -1 || close(fd))
+		fail("create refresh entry failed");
+	rewinddir(dir);
+	check_listing(dir, NFILES + 1);
+	if (unlink(added))
+		fail("unlink refresh entry failed");
+	rewinddir(dir);
+	check_listing(dir, NFILES);
+}
+
 static void check_rename(DIR *dir, const char *path)
 {
 	char renamed[PATH_MAX], marker[PATH_MAX];
@@ -101,7 +120,7 @@ static void check_rename(DIR *dir, const char *path)
 	if (rename(path, renamed))
 		fail("rename failed");
 	rewinddir(dir);
-	check_listing(dir);
+	check_listing(dir, NFILES);
 
 	/* Replacing the old path must not redirect that same directory stream. */
 	if (mkdir(path, 0700))
@@ -110,7 +129,7 @@ static void check_rename(DIR *dir, const char *path)
 	if (fd == -1 || close(fd))
 		fail("create replacement marker failed");
 	rewinddir(dir);
-	check_listing(dir);
+	check_listing(dir, NFILES);
 	if (unlink(marker) || rmdir(path) || rename(renamed, path))
 		fail("restore test directory failed");
 }
@@ -121,18 +140,18 @@ int main(int argc, char **argv)
 	const char *operation = argc == 3 ? argv[2] : "rename";
 
 	if (argc < 2 || argc > 3)
-		fail("usage: rewinddir MOUNTED_DIRECTORY [rename|rewind-eof|rewind-partial|seek]");
+		fail("usage: rewinddir MOUNTED_DIRECTORY [rename|rewind-eof|rewind-partial|seek|refresh]");
 	dir = opendir(argv[1]);
 	if (!dir)
 		fail("opendir failed");
-	check_listing(dir);
+	check_listing(dir, NFILES);
 
 	if (!strcmp(operation, "rename")) {
 		check_rename(dir, argv[1]);
 	} else if (!strcmp(operation, "rewind-eof")) {
 		for (unsigned i = 0; i < 3; i++) {
 			rewinddir(dir);
-			check_listing(dir);
+			check_listing(dir, NFILES);
 		}
 	} else if (!strcmp(operation, "rewind-partial")) {
 		rewinddir(dir);
@@ -141,10 +160,12 @@ int main(int argc, char **argv)
 				fail("partial read ended early");
 		}
 		rewinddir(dir);
-		check_listing(dir);
+		check_listing(dir, NFILES);
 	} else if (!strcmp(operation, "seek")) {
 		rewinddir(dir);
 		check_seek(dir);
+	} else if (!strcmp(operation, "refresh")) {
+		check_refresh(dir, argv[1]);
 	} else {
 		fail("unknown directory operation");
 	}
