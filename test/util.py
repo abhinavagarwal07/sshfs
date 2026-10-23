@@ -75,12 +75,16 @@ def cleanup(mount_process, mnt_dir):
     except subprocess.TimeoutExpired:
         pass
     finally:
-        mount_process.terminate()
+        # give it a moment to exit by itself, SIGTERM cuts its shutdown short
         try:
             mount_process.wait(1)
         except subprocess.TimeoutExpired:
-            mount_process.kill()
-            mount_process.wait()
+            mount_process.terminate()
+            try:
+                mount_process.wait(1)
+            except subprocess.TimeoutExpired:
+                mount_process.kill()
+                mount_process.wait()
 
 
 def umount(mount_process, mnt_dir):
