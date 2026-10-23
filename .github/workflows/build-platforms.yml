@@ -7,13 +7,13 @@ on:
   workflow_dispatch:
     inputs:
       git-ref:
-        description: Git ref to test, e.g. refs/pull/123/merge (optional)
+        description: Commit SHA or full ref to test, e.g. refs/pull/123/merge (optional)
         required: false
 
 permissions:
   contents: read
 
-# nothing here needs to save a cache, and dispatch runs may build other refs
+# the FreeBSD VM action saves a cache, and dispatch runs may build other refs
 cache-mode: read
 
 concurrency:
