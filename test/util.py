@@ -156,13 +156,14 @@ def require_macfuse_lazy_mount():
         pytest.fail("%s has no fuse_darwin_mount_started (macFUSE 5.3.3+ is required)" % lib)
 
 
-def run_isolated(cmdline, out_file, timeout, env=None):
-    """Run cmdline in its own process group with its output in out_file.
+@contextmanager
+def isolated_process(cmdline, out_file, env=None):
+    """Start cmdline in its own process group with its output in out_file, and
+    kill the whole group when the block ends.
 
-    Returns (exit status, output); the status is None on timeout. The output
-    goes to a file, not a pipe, because helper processes left behind by a failed
-    mount start can keep a pipe open after the process itself is gone. The
-    whole group is killed afterwards.
+    The output goes to a file, not a pipe, because helper processes left behind
+    by a failed mount start can keep a pipe open after the process itself is
+    gone.
     """
     with open(out_file, "w") as out:
         proc = subprocess.Popen(
@@ -174,9 +175,7 @@ def run_isolated(cmdline, out_file, timeout, env=None):
             start_new_session=True,
         )
         try:
-            rc = proc.wait(timeout=timeout)
-        except subprocess.TimeoutExpired:
-            rc = None
+            yield proc
         finally:
             try:
                 os.killpg(proc.pid, signal.SIGKILL)
@@ -184,6 +183,16 @@ def run_isolated(cmdline, out_file, timeout, env=None):
                 # nothing left to kill; macOS reports EPERM if only zombies remain
                 pass
             proc.wait()
+
+
+def run_isolated(cmdline, out_file, timeout, env=None):
+    """Run cmdline under isolated_process(); returns (exit status, output),
+    the status being None on timeout."""
+    with isolated_process(cmdline, out_file, env) as proc:
+        try:
+            rc = proc.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            rc = None
     with open(out_file) as f:
         return rc, f.read()
 
