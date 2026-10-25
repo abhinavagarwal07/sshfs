@@ -38,7 +38,7 @@ jobs:
         with:
           languages: c-cpp
           build-mode: manual
-          queries: security-extended
+          queries: security-and-quality
 
       - name: Install dependencies
         run: |
