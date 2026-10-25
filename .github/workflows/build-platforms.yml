@@ -2,18 +2,38 @@ name: platform builds
 
 on:
   push:
+    branches: [master]
   pull_request:
   workflow_dispatch:
+    inputs:
+      git-ref:
+        description: Commit SHA or full ref to test, e.g. refs/pull/123/merge (optional)
+        required: false
 
 permissions:
   contents: read
 
+# dispatch runs may build other refs, whose build code can reach the cache
+# credentials of later action steps, so don't let them save caches
+cache-mode: read
+
 concurrency:
-  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  # dispatch runs get their own group so they can't cancel (or be cancelled by)
+  # the run for the branch they were started from
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || (github.event_name == 'workflow_dispatch' && format('dispatch-{0}', inputs.git-ref || github.ref)) || github.ref }}
   cancel-in-progress: true
 
 jobs:
+  resolve:
+    name: resolve ref
+    if: github.event_name == 'workflow_dispatch' && inputs.git-ref != ''
+    uses: ./.github/workflows/resolve-ref.yml
+    with:
+      git-ref: ${{ inputs.git-ref }}
+
   linux-compat:
+    needs: resolve
+    if: ${{ !failure() && !cancelled() }}
     name: ${{ matrix.name }}
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 15
@@ -41,6 +61,14 @@ jobs:
             extra_cflags: "-D_FORTIFY_SOURCE=3 -fstack-protector-strong"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.resolve.outputs.sha }}
+          persist-credentials: false
+
+      - name: Show tested commit
+        run: |
+          git rev-parse HEAD
+          git cat-file -p HEAD | grep '^parent ' || true
 
       - name: Set up Python
         uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
@@ -51,7 +79,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y gcc ninja-build pkg-config libglib2.0-dev libfuse3-dev ${{ matrix.run_tests && 'openssh-server openssh-client fuse3' || '' }}
-          pip3 install meson ${{ matrix.run_tests && 'pytest pytest-timeout' || '' }}
+          pip3 install meson==1.12.1 ${{ matrix.run_tests && 'pytest==9.1.1 pytest-timeout==2.4.0' || '' }}
 
       - name: Build
         env:
@@ -103,11 +131,21 @@ jobs:
           path: build/meson-logs/
 
   alpine-musl:
+    needs: resolve
+    if: ${{ !failure() && !cancelled() }}
     name: alpine-musl
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.resolve.outputs.sha }}
+          persist-credentials: false
+
+      - name: Show tested commit
+        run: |
+          git rev-parse HEAD
+          git cat-file -p HEAD | grep '^parent ' || true
 
       - name: Build in Alpine container
         run: |
@@ -125,19 +163,31 @@ jobs:
           path: build-alpine/meson-logs/
 
   freebsd:
+    needs: resolve
+    if: ${{ !failure() && !cancelled() }}
     name: freebsd-14
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.resolve.outputs.sha }}
+          persist-credentials: false
+
+      - name: Show tested commit
+        run: |
+          git rev-parse HEAD
+          git cat-file -p HEAD | grep '^parent ' || true
 
       - name: Build on FreeBSD
         uses: vmactions/freebsd-vm@77ed28d336d03fe19a3f4f7266c1d2c4714dd79d # v1.5.2
         with:
+          release: '14.4'
           usesh: true
           prepare: |
             pkg install -y fusefs-libs3 glib meson ninja pkgconf
           run: |
+            freebsd-version
             meson setup build-freebsd
             ninja -C build-freebsd
 
